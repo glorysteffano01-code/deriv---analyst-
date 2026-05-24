@@ -1,0 +1,1161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>DerivEngine - Live Trading Engine</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet"/>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0;}
+    body{background:#060f1a;color:#c8ddf0;font-family:'JetBrains Mono',monospace;}
+    ::-webkit-scrollbar{width:4px;height:4px;}
+    ::-webkit-scrollbar-track{background:#060f1a;}
+    ::-webkit-scrollbar-thumb{background:#1e2d3d;border-radius:2px;}
+    input[type=number]::-webkit-inner-spin-button{-webkit-appearance:none;}
+    select option{background:#0a1929;color:#c8ddf0;}
+    button,input,select{font-family:'JetBrains Mono',monospace;}
+    @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.3}}
+    @keyframes slideIn{from{transform:translateY(-6px);opacity:0}to{transform:translateY(0);opacity:1}}
+    @keyframes glowGreen{0%,100%{box-shadow:0 0 6px rgba(0,229,155,0.2)}50%{box-shadow:0 0 18px rgba(0,229,155,0.6)}}
+    @keyframes glowRed{0%,100%{box-shadow:0 0 6px rgba(255,77,109,0.2)}50%{box-shadow:0 0 18px rgba(255,77,109,0.6)}}
+    .pulse{animation:pulse 1.4s infinite;}
+    .slide-in{animation:slideIn 0.25s ease;}
+    .glow-green{animation:glowGreen 2s infinite;}
+    .glow-red{animation:glowRed 2s infinite;}
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const {useState,useEffect,useRef,useCallback}=React;
+
+// ── Math ─────────────────────────────────────────────────────────────────────
+function sma(d,p){return d.map((_,i)=>i<p-1?null:d.slice(i-p+1,i+1).reduce((s,v)=>s+v,0)/p);}
+function ema(d,p){
+  const k=2/(p+1),r=[];let e=null;
+  for(let i=0;i<d.length;i++){
+    if(i<p-1){r.push(null);continue;}
+    if(e===null){e=d.slice(0,p).reduce((s,v)=>s+v,0)/p;r.push(e);continue;}
+    e=d[i]*k+e*(1-k);r.push(e);
+  }
+  return r;
+}
+function calcRSI(c,p=14){
+  const r=Array(c.length).fill(null);
+  if(c.length<p+1)return r;
+  let g=0,l=0;
+  for(let i=1;i<=p;i++){const d=c[i]-c[i-1];d>0?g+=d:l-=d;}
+  let ag=g/p,al=l/p;
+  r[p]=100-100/(1+ag/(al||1e-10));
+  for(let i=p+1;i<c.length;i++){
+    const d=c[i]-c[i-1];
+    ag=(ag*(p-1)+Math.max(d,0))/p;al=(al*(p-1)+Math.max(-d,0))/p;
+    r[i]=100-100/(1+ag/(al||1e-10));
+  }
+  return r;
+}
+function calcMACD(c,f=12,s=26,sg=9){
+  const ef=ema(c,f),es=ema(c,s);
+  const ml=c.map((_,i)=>ef[i]!=null&&es[i]!=null?ef[i]-es[i]:null);
+  const raw=ema(ml.filter(v=>v!=null),sg);
+  let si=0;
+  const sl=ml.map(v=>v==null?null:(raw[si++]??null));
+  const h=ml.map((v,i)=>v!=null&&sl[i]!=null?v-sl[i]:null);
+  return{ml,sl,h};
+}
+function calcBoll(c,p=20,sd=2){
+  const s=sma(c,p);
+  return c.map((_,i)=>{
+    if(s[i]==null)return{upper:null,mid:null,lower:null,bw:null};
+    const sl=c.slice(i-p+1,i+1),m=s[i];
+    const std=Math.sqrt(sl.reduce((s,v)=>s+(v-m)**2,0)/p);
+    return{upper:m+sd*std,mid:m,lower:m-sd*std,bw:(sd*2*std)/m*100};
+  });
+}
+function calcATR(cs,p=14){
+  const tr=cs.map((c,i)=>{
+    if(i===0)return c.high-c.low;
+    const pv=cs[i-1];
+    return Math.max(c.high-c.low,Math.abs(c.high-pv.close),Math.abs(c.low-pv.close));
+  });
+  return tr.map((_,i)=>i<p-1?null:tr.slice(i-p+1,i+1).reduce((s,v)=>s+v,0)/p);
+}
+function calcStoch(cs,kp=14,dp=3){
+  const k=cs.map((_,i)=>{
+    if(i<kp-1)return null;
+    const sl=cs.slice(i-kp+1,i+1);
+    const hi=Math.max(...sl.map(c=>c.high)),lo=Math.min(...sl.map(c=>c.low));
+    return hi===lo?50:(cs[i].close-lo)/(hi-lo)*100;
+  });
+  const d=k.map((_,i)=>{
+    const v=k.slice(Math.max(0,i-dp+1),i+1).filter(v=>v!=null);
+    return v.length===dp?v.reduce((s,v)=>s+v,0)/dp:null;
+  });
+  return{k,d};
+}
+
+// ── Signal Engine ─────────────────────────────────────────────────────────────
+function analyze(candles,stake=30){
+  if(candles.length<30)return null;
+  const closes=candles.map(c=>c.close);
+  const rsiV=calcRSI(closes);
+  const {ml,sl:sigL,h:hist}=calcMACD(closes);
+  const bollV=calcBoll(closes);
+  const atrV=calcATR(candles);
+  const {k:stK,d:stD}=calcStoch(candles);
+  const e9=ema(closes,9),e20=ema(closes,20),e50=ema(closes,Math.min(50,closes.length-1));
+  const i=closes.length-1;
+  const price=closes[i];
+  const lRSI=rsiV[i],lBoll=bollV[i],lATR=atrV[i];
+  const lML=ml[i],lSL=sigL[i],lH=hist[i],pH=hist[i-1];
+  const lStK=stK[i],lStD=stD[i];
+  const lE9=e9[i],lE20=e20[i],lE50=e50[i];
+  if(!lRSI||!lBoll.upper||!lATR||!lML||!lStK||!lE20)return null;
+
+  const trendUp=lE9>lE20&&lE20>(lE50||0);
+  const trendDown=lE9<lE20&&lE20<(lE50||price);
+  const recentH=candles.slice(-20).map(c=>c.high);
+  const recentL=candles.slice(-20).map(c=>c.low);
+  const resist=Math.max(...recentH),supp=Math.min(...recentL);
+  const nearSupp=price<supp+(resist-supp)*0.15;
+  const nearResist=price>resist-(resist-supp)*0.15;
+  const bwPct=lBoll.bw||0;
+  const isSqueeze=bwPct<2.5;
+  const isExpanding=bwPct>5;
+
+  let buyS=0,sellS=0,sigs=[];
+
+  // RSI
+  if(lRSI<22){buyS+=35;sigs.push({n:"RSI Deeply Oversold",t:"BUY",s:"STRONG",v:lRSI.toFixed(1)});}
+  else if(lRSI<32){buyS+=20;sigs.push({n:"RSI Oversold",t:"BUY",s:"MEDIUM",v:lRSI.toFixed(1)});}
+  else if(lRSI<42){buyS+=8;sigs.push({n:"RSI Below Mid",t:"BUY",s:"WEAK",v:lRSI.toFixed(1)});}
+  else if(lRSI>78){sellS+=35;sigs.push({n:"RSI Deeply Overbought",t:"SELL",s:"STRONG",v:lRSI.toFixed(1)});}
+  else if(lRSI>68){sellS+=20;sigs.push({n:"RSI Overbought",t:"SELL",s:"MEDIUM",v:lRSI.toFixed(1)});}
+  else if(lRSI>58){sellS+=8;sigs.push({n:"RSI Above Mid",t:"SELL",s:"WEAK",v:lRSI.toFixed(1)});}
+
+  // MACD
+  if(lH!=null&&pH!=null){
+    if(lH>0&&pH<=0){buyS+=28;sigs.push({n:"MACD Bullish Cross",t:"BUY",s:"STRONG",v:"New cross"});}
+    else if(lH<0&&pH>=0){sellS+=28;sigs.push({n:"MACD Bearish Cross",t:"SELL",s:"STRONG",v:"New cross"});}
+    else if(lH>0&&lH>pH){buyS+=12;sigs.push({n:"MACD Rising",t:"BUY",s:"WEAK",v:"Momentum up"});}
+    else if(lH<0&&lH<pH){sellS+=12;sigs.push({n:"MACD Falling",t:"SELL",s:"WEAK",v:"Momentum down"});}
+  }
+
+  // Bollinger
+  if(price<=lBoll.lower){buyS+=28;sigs.push({n:"Price at BB Lower",t:"BUY",s:"STRONG",v:"Lower band touch"});}
+  else if(price>=lBoll.upper){sellS+=28;sigs.push({n:"Price at BB Upper",t:"SELL",s:"STRONG",v:"Upper band touch"});}
+  else if(price<lBoll.mid){buyS+=8;}
+  else{sellS+=8;}
+
+  // EMA Trend
+  if(trendUp){buyS+=22;sigs.push({n:"EMA Bullish Stack",t:"BUY",s:"STRONG",v:"9>20>50"});}
+  else if(trendDown){sellS+=22;sigs.push({n:"EMA Bearish Stack",t:"SELL",s:"STRONG",v:"9<20<50"});}
+
+  // Stochastic
+  if(lStK<20&&lStD!=null&&lStK>lStD){buyS+=22;sigs.push({n:"Stoch Oversold Cross",t:"BUY",s:"STRONG",v:`K:${lStK.toFixed(0)} D:${lStD.toFixed(0)}`});}
+  else if(lStK>80&&lStD!=null&&lStK<lStD){sellS+=22;sigs.push({n:"Stoch Overbought Cross",t:"SELL",s:"STRONG",v:`K:${lStK.toFixed(0)} D:${lStD.toFixed(0)}`});}
+
+  // Support/Resistance
+  if(nearSupp){buyS+=18;sigs.push({n:"Near Key Support",t:"BUY",s:"STRONG",v:supp.toFixed(2)});}
+  if(nearResist){sellS+=18;sigs.push({n:"Near Key Resistance",t:"SELL",s:"STRONG",v:resist.toFixed(2)});}
+
+  // Squeeze
+  if(isSqueeze)sigs.push({n:"BB Squeeze",t:"ALERT",s:"ALERT",v:"Breakout coming"});
+
+  const dir=buyS>=sellS?"BUY":"SELL";
+  const total=buyS+sellS||1;
+  const conf=Math.min(95,Math.max(30,Math.round(Math.max(buyS,sellS)/total*100)));
+
+  let eType="";
+  if((trendUp&&dir==="BUY")||(trendDown&&dir==="SELL"))eType="TREND FOLLOW";
+  else if((nearSupp&&dir==="BUY")||(nearResist&&dir==="SELL"))eType="REVERSAL";
+  else if(isExpanding)eType="BREAKOUT";
+  else eType="REVERSAL";
+
+  const spread=price*0.0002;
+  const entry=dir==="BUY"?price+spread:price-spread;
+  const mult=conf>70?1.5:2.0;
+  const stopL=dir==="BUY"?entry-lATR*mult:entry+lATR*mult;
+  const tp1=dir==="BUY"?entry+lATR*2:entry-lATR*2;
+  const tp2=dir==="BUY"?entry+lATR*3.5:entry-lATR*3.5;
+  const tp3=dir==="BUY"?entry+lATR*5:entry-lATR*5;
+  const rr=Math.abs(tp1-entry)/Math.abs(entry-stopL);
+  const sugStake=Math.max(stake*0.4,Math.min(stake,stake*conf/100));
+  const wait=conf<52||isSqueeze;
+
+  return{dir,conf,eType,entry,stopL,tp1,tp2,tp3,rr,sugStake,sigs,wait,isSqueeze,
+    lRSI,lStK,lStD:lStD??0,lBoll,lATR,supp,resist,bwPct,
+    trendUp,trendDown,price,lE9,lE20,lE50:lE50??price,lML,lSL,lH,buyS,sellS};
+}
+
+// ── Markets ───────────────────────────────────────────────────────────────────
+const MARKETS=[
+  {id:"v75",  label:"V75",    full:"Volatility 75",    type:"SYN",base:1200, vol:0.018,color:"#00e59b"},
+  {id:"v25",  label:"V25",    full:"Volatility 25",    type:"SYN",base:5200, vol:0.010,color:"#00aaff"},
+  {id:"v10",  label:"V10",    full:"Volatility 10",    type:"SYN",base:9800, vol:0.006,color:"#a78bfa"},
+  {id:"v50",  label:"V50",    full:"Volatility 50",    type:"SYN",base:3100, vol:0.013,color:"#f0c040"},
+  {id:"v100", label:"V100",   full:"Volatility 100",   type:"SYN",base:900,  vol:0.022,color:"#ff9f43"},
+  {id:"cr1k", label:"CRH1K",  full:"Crash 1000",       type:"SYN",base:8800, vol:0.015,color:"#ff4d6d"},
+  {id:"bm1k", label:"BOM1K",  full:"Boom 1000",        type:"SYN",base:7200, vol:0.015,color:"#00e59b"},
+  {id:"cr500",label:"CRH500", full:"Crash 500",        type:"SYN",base:7500, vol:0.014,color:"#ff6b9d"},
+  {id:"bm500",label:"BOM500", full:"Boom 500",         type:"SYN",base:6500, vol:0.014,color:"#26de81"},
+  {id:"rng",  label:"RNG",    full:"Range Break 100",  type:"SYN",base:2000, vol:0.008,color:"#fd9644"},
+  {id:"eu",   label:"EUR/USD",full:"EUR/USD",          type:"FX", base:1.085,vol:0.004,color:"#00aaff"},
+  {id:"gu",   label:"GBP/USD",full:"GBP/USD",          type:"FX", base:1.268,vol:0.005,color:"#a78bfa"},
+  {id:"uj",   label:"USD/JPY",full:"USD/JPY",          type:"FX", base:149.5,vol:0.004,color:"#f0c040"},
+  {id:"au",   label:"AUD/USD",full:"AUD/USD",          type:"FX", base:0.652,vol:0.004,color:"#ff9f43"},
+];
+
+function genCandles(base,count=80,vol=0.012){
+  const cs=[],now=Date.now();let pr=base,trend=0,tLen=0;
+  for(let i=count;i>=0;i--){
+    if(tLen<=0){trend=(Math.random()-0.5)*0.006;tLen=Math.floor(Math.random()*12)+4;}
+    tLen--;
+    const o=pr,mv=(trend+(Math.random()-0.5)*vol)*pr,c=o+mv;
+    const rng=Math.abs(mv)*(1.5+Math.random());
+    cs.push({time:new Date(now-i*5*60000),open:o,high:Math.max(o,c)+rng*0.3,low:Math.min(o,c)-rng*0.3,close:c});
+    pr=c;
+  }
+  return cs;
+}
+
+// ── Chart ─────────────────────────────────────────────────────────────────────
+function Chart({candles,an}){
+  if(!candles.length)return null;
+  const W=560,H=200,pad={l:52,r:12,t:10,b:24};
+  const cw=W-pad.l-pad.r,ch=H-pad.t-pad.b;
+  const show=candles.slice(-50);
+  const closes=show.map(c=>c.close);
+  const bollV=calcBoll(closes);
+  const e9v=ema(closes,Math.min(9,closes.length));
+  const e20v=ema(closes,Math.min(20,closes.length));
+  const prices=show.flatMap(c=>[c.high,c.low]);
+  const bPx=bollV.flatMap(b=>b.upper!=null?[b.upper,b.lower]:[]);
+  const extra=an?[an.tp1,an.stopL,an.entry].filter(v=>v>0):[];
+  const all=[...prices,...bPx,...extra];
+  const minP=Math.min(...all),maxP=Math.max(...all),pr=maxP-minP||1;
+  const sy=v=>pad.t+ch-((v-minP)/pr)*ch,sx=i=>pad.l+(i/(show.length-1))*cw;
+  const cw2=Math.max(2,cw/show.length*0.65);
+  const xStep=Math.max(1,Math.floor(show.length/5));
+  const linePath=arr=>arr.map((v,i)=>v==null?"":`${i===0||arr[i-1]==null?"M":"L"} ${sx(i)} ${sy(v)}`).join(" ");
+  const bUp=bollV.map((b,i)=>b.upper!=null?`${sx(i)},${sy(b.upper)}`:null).filter(Boolean);
+  const bLo=bollV.map((b,i)=>b.lower!=null?`${sx(i)},${sy(b.lower)}`:null).filter(Boolean).reverse();
+  return(
+    <svg viewBox={`0 0 ${W} ${H}`} style={{width:"100%",display:"block"}}>
+      {[0,0.25,0.5,0.75,1].map((t,i)=>{
+        const v=minP+pr*t;
+        return<g key={i}><line x1={pad.l} y1={sy(v)} x2={W-pad.r} y2={sy(v)} stroke="#0e2235" strokeWidth="1"/><text x={pad.l-4} y={sy(v)+4} textAnchor="end" fill="#2a3f55" fontSize="8" fontFamily="monospace">{v.toFixed(v>10?1:4)}</text></g>;
+      })}
+      {bUp.length&&<><path d={`M ${bUp.join(" L ")} L ${bLo.join(" L ")} Z`} fill="rgba(0,170,255,0.05)"/><path d={linePath(bollV.map(b=>b.upper))} fill="none" stroke="rgba(0,170,255,0.35)" strokeWidth="0.8" strokeDasharray="3,2"/><path d={linePath(bollV.map(b=>b.lower))} fill="none" stroke="rgba(0,170,255,0.35)" strokeWidth="0.8" strokeDasharray="3,2"/><path d={linePath(bollV.map(b=>b.mid))} fill="none" stroke="rgba(0,170,255,0.2)" strokeWidth="0.8"/></>}
+      <path d={linePath(e20v)} fill="none" stroke="#f0c040" strokeWidth="1" opacity="0.7"/>
+      <path d={linePath(e9v)} fill="none" stroke="#00aaff" strokeWidth="1" opacity="0.8"/>
+      {show.map((c,i)=>{
+        const x=sx(i),up=c.close>=c.open,col=up?"#00e59b":"#ff4d6d";
+        const bt=sy(Math.max(c.open,c.close)),bb=sy(Math.min(c.open,c.close));
+        return<g key={i}><line x1={x} y1={sy(c.high)} x2={x} y2={sy(c.low)} stroke={col} strokeWidth="0.8" opacity="0.9"/><rect x={x-cw2/2} y={bt} width={cw2} height={Math.max(1,bb-bt)} fill={col} opacity="0.9"/></g>;
+      })}
+      {an&&an.entry>=minP&&an.entry<=maxP&&<><line x1={pad.l} y1={sy(an.entry)} x2={W-pad.r} y2={sy(an.entry)} stroke={an.dir==="BUY"?"#00e59b":"#ff4d6d"} strokeWidth="1.5" strokeDasharray="5,3"/><text x={W-pad.r} y={sy(an.entry)-3} textAnchor="end" fill={an.dir==="BUY"?"#00e59b":"#ff4d6d"} fontSize="8" fontFamily="monospace">ENTRY</text></>}
+      {an&&an.tp1>=minP&&an.tp1<=maxP&&<><line x1={pad.l} y1={sy(an.tp1)} x2={W-pad.r} y2={sy(an.tp1)} stroke="#00e59b" strokeWidth="1" strokeDasharray="3,3" opacity="0.7"/><text x={W-pad.r} y={sy(an.tp1)-3} textAnchor="end" fill="#00e59b" fontSize="8" fontFamily="monospace">TP1</text></>}
+      {an&&an.stopL>=minP&&an.stopL<=maxP&&<><line x1={pad.l} y1={sy(an.stopL)} x2={W-pad.r} y2={sy(an.stopL)} stroke="#ff4d6d" strokeWidth="1" strokeDasharray="3,3" opacity="0.7"/><text x={W-pad.r} y={sy(an.stopL)+10} textAnchor="end" fill="#ff4d6d" fontSize="8" fontFamily="monospace">SL</text></>}
+      {show.filter((_,i)=>i%xStep===0).map((c,i)=>(
+        <text key={i} x={sx(i*xStep)} y={H-4} textAnchor="middle" fill="#2a3f55" fontSize="8" fontFamily="monospace">{c.time.toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"})}</text>
+      ))}
+      <text x={pad.l+4} y={pad.t+10} fill="#f0c040" fontSize="8" fontFamily="monospace">EMA20</text>
+      <text x={pad.l+44} y={pad.t+10} fill="#00aaff" fontSize="8" fontFamily="monospace">EMA9</text>
+    </svg>
+  );
+}
+
+// ── Confidence Arc ─────────────────────────────────────────────────────────────
+function Arc({val,dir}){
+  const col=val>=70?"#00e59b":val>=52?"#f0c040":"#ff4d6d";
+  const rad=a=>(a*Math.PI)/180,cx=65,cy=65,r=50;
+  const ang=-180+(val/100)*180;
+  const gx=cx+r*Math.cos(rad(ang)),gy=cy+r*Math.sin(rad(ang));
+  return(
+    <svg viewBox="0 0 130 80" style={{width:130}}>
+      <path d={`M ${cx-r} ${cy} A ${r} ${r} 0 0 1 ${cx+r} ${cy}`} fill="none" stroke="#0e2235" strokeWidth="10" strokeLinecap="round"/>
+      <path d={`M ${cx-r} ${cy} A ${r} ${r} 0 0 1 ${gx} ${gy}`} fill="none" stroke={col} strokeWidth="10" strokeLinecap="round" opacity="0.9"/>
+      <circle cx={gx} cy={gy} r={6} fill={col}/>
+      <text x={cx} y={cy-10} textAnchor="middle" fill={col} fontSize="20" fontWeight="700" fontFamily="monospace">{val}%</text>
+      <text x={cx} y={cy+6} textAnchor="middle" fill={col} fontSize="9" fontWeight="700" fontFamily="monospace" letterSpacing="2">{dir}</text>
+    </svg>
+  );
+}
+
+// ── Entry Signal Card ─────────────────────────────────────────────────────────
+function EntryCard({an,market,stake}){
+  if(!an)return(<div style={{padding:40,textAlign:"center",color:"#2a3f55",fontSize:12}}>Add 30+ candles to activate engine</div>);
+  const fmt=v=>v.toFixed(v>10?2:5);
+  const col=an.dir==="BUY"?"#00e59b":"#ff4d6d";
+
+  if(an.isSqueeze)return(
+    <div style={{padding:20,textAlign:"center"}}>
+      <div style={{fontSize:36,marginBottom:10}}>🔥</div>
+      <div style={{color:"#00aaff",fontSize:15,fontWeight:700,marginBottom:8}}>SQUEEZE DETECTED</div>
+      <div style={{color:"#4a6080",fontSize:11,lineHeight:1.8,marginBottom:16}}>Bollinger Bands are very tight. A major breakout move is building up. Watch price closely and enter in the direction of the first strong candle break.</div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+        <div style={{background:"rgba(0,229,155,0.08)",border:"1px solid #00e59b30",borderRadius:6,padding:10}}>
+          <div style={{color:"#4a6080",fontSize:9,marginBottom:4}}>BREAK UP → TARGET</div>
+          <div style={{color:"#00e59b",fontSize:14,fontWeight:700}}>{fmt(an.resist)}</div>
+        </div>
+        <div style={{background:"rgba(255,77,109,0.08)",border:"1px solid #ff4d6d30",borderRadius:6,padding:10}}>
+          <div style={{color:"#4a6080",fontSize:9,marginBottom:4}}>BREAK DOWN → TARGET</div>
+          <div style={{color:"#ff4d6d",fontSize:14,fontWeight:700}}>{fmt(an.supp)}</div>
+        </div>
+      </div>
+    </div>
+  );
+
+  if(an.wait)return(
+    <div style={{padding:30,textAlign:"center"}}>
+      <div style={{fontSize:36,marginBottom:10}}>⏳</div>
+      <div style={{color:"#f0c040",fontSize:14,fontWeight:700,marginBottom:8}}>WAIT — No Clear Entry</div>
+      <div style={{color:"#4a6080",fontSize:11,lineHeight:1.8}}>Confidence is {an.conf}% — below the minimum threshold of 52%. Market conditions are unclear. Do not force a trade. Wait 1-3 candles for a stronger setup to form.</div>
+      <div style={{marginTop:16,display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+        <div style={{background:"rgba(0,229,155,0.05)",border:"1px solid #00e59b20",borderRadius:6,padding:10}}>
+          <div style={{color:"#2a3f55",fontSize:9,marginBottom:3}}>BUY PRESSURE</div>
+          <div style={{color:"#00e59b",fontSize:16,fontWeight:700}}>{an.buyS}pts</div>
+        </div>
+        <div style={{background:"rgba(255,77,109,0.05)",border:"1px solid #ff4d6d20",borderRadius:6,padding:10}}>
+          <div style={{color:"#2a3f55",fontSize:9,marginBottom:3}}>SELL PRESSURE</div>
+          <div style={{color:"#ff4d6d",fontSize:16,fontWeight:700}}>{an.sellS}pts</div>
+        </div>
+      </div>
+    </div>
+  );
+
+  return(
+    <div>
+      {/* Direction + Confidence */}
+      <div className={an.dir==="BUY"?"glow-green":"glow-red"} style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"12px 16px",background:col+"0d",borderRadius:8,border:`1px solid ${col}35`,marginBottom:14}}>
+        <div>
+          <div style={{color:col,fontSize:20,fontWeight:700,letterSpacing:1}}>{an.dir==="BUY"?"▲ BUY / RISE":"▼ SELL / FALL"}</div>
+          <div style={{color:"#4a6080",fontSize:10,marginTop:4}}>{an.eType} · {(an.dir==="BUY"&&an.trendUp)||(an.dir==="SELL"&&an.trendDown)?"WITH TREND ✓":"COUNTER TREND"}</div>
+          <div style={{color:"#2a3f55",fontSize:10,marginTop:2}}>{market.full}</div>
+        </div>
+        <Arc val={an.conf} dir={an.dir}/>
+      </div>
+
+      {/* Price levels */}
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:12}}>
+        {[
+          {lb:"ENTRY PRICE",v:fmt(an.entry),c:col},
+          {lb:"CURRENT PRICE",v:fmt(an.price),c:"#c8ddf0"},
+          {lb:"STOP LOSS",v:fmt(an.stopL),c:"#ff4d6d"},
+          {lb:"TAKE PROFIT 1",v:fmt(an.tp1),c:"#00e59b"},
+          {lb:"TAKE PROFIT 2",v:fmt(an.tp2),c:"#00aaff"},
+          {lb:"TAKE PROFIT 3",v:fmt(an.tp3),c:"#a78bfa"},
+          {lb:"RISK : REWARD",v:`1 : ${an.rr.toFixed(2)}`,c:"#f0c040"},
+          {lb:"SUGGESTED STAKE",v:`$${an.sugStake.toFixed(2)}`,c:"#f0c040"},
+        ].map(({lb,v,c})=>(
+          <div key={lb} style={{background:"#060f1a",border:"1px solid #0e2235",borderRadius:6,padding:"8px 10px"}}>
+            <div style={{color:"#2a3f55",fontSize:9,textTransform:"uppercase",letterSpacing:1,marginBottom:3}}>{lb}</div>
+            <div style={{color:c,fontSize:13,fontWeight:700}}>{v}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* How to trade */}
+      <div style={{background:"#060f1a",border:`1px solid ${col}25`,borderRadius:6,padding:"12px 14px",marginBottom:12}}>
+        <div style={{color:col,fontSize:10,fontWeight:700,letterSpacing:1,marginBottom:8}}>📋 HOW TO ENTER THIS TRADE ON DERIV</div>
+        <div style={{color:"#8aa0b8",fontSize:11,lineHeight:2}}>
+          1. Open Deriv → select <strong style={{color:"#c8ddf0"}}>{market.full}</strong><br/>
+          2. Choose <strong style={{color:col}}>{an.dir==="BUY"?"Rise / Higher":"Fall / Lower"}</strong><br/>
+          3. Stake: <strong style={{color:"#f0c040"}}>${an.sugStake.toFixed(2)}</strong><br/>
+          4. Enter near: <strong style={{color:col}}>{fmt(an.entry)}</strong><br/>
+          5. Close trade if price hits SL: <strong style={{color:"#ff4d6d"}}>{fmt(an.stopL)}</strong><br/>
+          6. Take profit at TP1: <strong style={{color:"#00e59b"}}>{fmt(an.tp1)}</strong><br/>
+          7. Let rest run to TP2: <strong style={{color:"#00aaff"}}>{fmt(an.tp2)}</strong>
+        </div>
+      </div>
+
+      {/* Warning */}
+      {an.conf<70&&(
+        <div style={{padding:"8px 12px",background:"rgba(240,192,64,0.05)",border:"1px solid rgba(240,192,64,0.2)",borderRadius:6,fontSize:10,color:"#f0c040",lineHeight:1.7}}>
+          ⚠️ Moderate confidence ({an.conf}%). Reduce stake or wait for confluence. Never risk more than you can afford to lose.
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Indicators Panel ──────────────────────────────────────────────────────────
+function IndicatorsPanel({an}){
+  if(!an)return(<div style={{padding:32,textAlign:"center",color:"#2a3f55",fontSize:12}}>No data yet</div>);
+  const fmt=v=>typeof v==="number"?v.toFixed(v>10?2:4):v;
+  const rows=[
+    {lb:"RSI (14)",v:an.lRSI.toFixed(1),col:an.lRSI>70?"#ff4d6d":an.lRSI<30?"#00e59b":"#f0c040",bar:an.lRSI,max:100,signal:an.lRSI>70?"SELL":an.lRSI<30?"BUY":"NEUTRAL"},
+    {lb:"Stoch K",v:an.lStK.toFixed(1),col:an.lStK>80?"#ff4d6d":an.lStK<20?"#00e59b":"#f0c040",bar:an.lStK,max:100,signal:an.lStK>80?"SELL":an.lStK<20?"BUY":"NEUTRAL"},
+    {lb:"Stoch D",v:an.lStD.toFixed(1),col:an.lStD>80?"#ff4d6d":an.lStD<20?"#00e59b":"#f0c040",bar:an.lStD,max:100,signal:an.lStD>80?"SELL":an.lStD<20?"BUY":"NEUTRAL"},
+    {lb:"MACD Line",v:fmt(an.lML),col:an.lML>0?"#00e59b":"#ff4d6d",signal:an.lML>0?"BUY":"SELL"},
+    {lb:"MACD Signal",v:fmt(an.lSL),col:an.lML>an.lSL?"#00e59b":"#ff4d6d",signal:an.lML>an.lSL?"BUY":"SELL"},
+    {lb:"BB Upper",v:fmt(an.lBoll.upper),col:"#00aaff",signal:"—"},
+    {lb:"BB Middle",v:fmt(an.lBoll.mid),col:"#4a6080",signal:"—"},
+    {lb:"BB Lower",v:fmt(an.lBoll.lower),col:"#00aaff",signal:"—"},
+    {lb:"BB Width %",v:an.bwPct.toFixed(2)+"%",col:an.bwPct<2.5?"#f0c040":"#4a6080",signal:an.bwPct<2.5?"SQUEEZE":an.bwPct>5?"WIDE":"NORMAL"},
+    {lb:"EMA 9",v:fmt(an.lE9),col:an.lE9>an.lE20?"#00e59b":"#ff4d6d",signal:an.lE9>an.lE20?"BUY":"SELL"},
+    {lb:"EMA 20",v:fmt(an.lE20),col:an.lE20>an.lE50?"#00e59b":"#ff4d6d",signal:an.lE20>an.lE50?"BUY":"SELL"},
+    {lb:"ATR (14)",v:fmt(an.lATR),col:"#8aa0b8",signal:"Volatility"},
+    {lb:"Support",v:fmt(an.supp),col:"#00e59b",signal:"Level"},
+    {lb:"Resistance",v:fmt(an.resist),col:"#ff4d6d",signal:"Level"},
+  ];
+  const sigCols={BUY:"#00e59b",SELL:"#ff4d6d",NEUTRAL:"#f0c040",SQUEEZE:"#00aaff",WIDE:"#8aa0b8",NORMAL:"#4a6080","—":"#2a3f55",Level:"#8aa0b8",Volatility:"#8aa0b8"};
+  return(
+    <div>
+      {rows.map(({lb,v,col,bar,max,signal})=>(
+        <div key={lb} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"7px 0",borderBottom:"1px solid #0a1929"}}>
+          <span style={{color:"#4a6080",fontSize:11,minWidth:100}}>{lb}</span>
+          <div style={{flex:1,margin:"0 10px"}}>
+            {bar!=null&&<div style={{height:3,background:"#0e2235",borderRadius:2}}><div style={{height:3,width:`${bar/max*100}%`,background:col,borderRadius:2,transition:"width 0.3s"}}/></div>}
+          </div>
+          <span style={{color:col,fontSize:12,fontWeight:700,minWidth:70,textAlign:"right"}}>{v}</span>
+          <span style={{background:(sigCols[signal]||"#2a3f55")+"20",color:sigCols[signal]||"#2a3f55",fontSize:9,fontWeight:700,padding:"1px 7px",borderRadius:3,marginLeft:8,minWidth:60,textAlign:"center"}}>{signal}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ── Signals List ──────────────────────────────────────────────────────────────
+function SignalsList({sigs}){
+  if(!sigs||!sigs.length)return(<div style={{color:"#2a3f55",fontSize:11,padding:"20px 0",textAlign:"center"}}>No signals detected yet</div>);
+  const cols={BUY:"#00e59b",SELL:"#ff4d6d",NEUTRAL:"#f0c040",ALERT:"#00aaff"};
+  const sCols={STRONG:"#00e59b",MEDIUM:"#f0c040",WEAK:"#4a6080",ALERT:"#00aaff"};
+  return(
+    <div>
+      {sigs.map((sg,i)=>(
+        <div key={i} className="slide-in" style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"7px 10px",marginBottom:5,background:(cols[sg.t]||"#4a6080")+"0d",borderRadius:5,border:`1px solid ${cols[sg.t]||"#4a6080"}25`}}>
+          <div style={{display:"flex",alignItems:"center",gap:8}}>
+            <span style={{width:6,height:6,borderRadius:"50%",background:sCols[sg.s]||"#4a6080",display:"inline-block"}}/>
+            <span style={{color:"#8aa0b8",fontSize:11}}>{sg.n}</span>
+          </div>
+          <div style={{display:"flex",gap:6,alignItems:"center"}}>
+            <span style={{color:"#4a6080",fontSize:10}}>{sg.v}</span>
+            <span style={{background:(cols[sg.t]||"#4a6080")+"20",color:cols[sg.t]||"#4a6080",fontSize:9,fontWeight:700,padding:"1px 7px",borderRadius:3}}>{sg.t}</span>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ── Manual Candle Form ────────────────────────────────────────────────────────
+function CandleForm({onAdd,lastClose}){
+  const [f,setF]=useState({o:lastClose.toFixed(2),h:"",l:"",c:""});
+  const set=(k,v)=>setF(p=>({...p,[k]:v}));
+  const submit=()=>{
+    const o=+f.o,h=+f.h,l=+f.l,c=+f.c;
+    if(!o||!h||!l||!c)return;
+    if(h<Math.max(o,c)||l>Math.min(o,c)){alert("High >= max(O,C) and Low <= min(O,C)");return;}
+    onAdd({open:o,high:h,low:l,close:c,time:new Date()});
+    setF({o:c.toFixed(2),h:"",l:"",c:""});
+  };
+  const inp={background:"#060f1a",border:"1px solid #1e2d3d",borderRadius:4,color:"#c8ddf0",padding:"6px 8px",width:"100%",fontSize:12,outline:"none"};
+  return(
+    <div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr",gap:6,marginBottom:8}}>
+        {[["o","Open"],["h","High"],["l","Low"],["c","Close"]].map(([k,lb])=>(
+          <div key={k}>
+            <div style={{color:"#2a3f55",fontSize:9,marginBottom:3,textTransform:"uppercase"}}>{lb}</div>
+            <input style={inp} value={f[k]} onChange={e=>set(k,e.target.value)} type="number" step="any" placeholder="0.00"/>
+          </div>
+        ))}
+      </div>
+      <button onClick={submit} style={{width:"100%",background:"linear-gradient(135deg,#00e59b,#00aaff)",border:"none",borderRadius:4,color:"#000",padding:"8px",fontWeight:700,cursor:"pointer",fontSize:12}}>+ ADD CANDLE</button>
+    </div>
+  );
+}
+
+// ── MT5 Calculator ────────────────────────────────────────────────────────────
+const MT5_INSTRUMENTS=[
+  {id:"v75",  label:"Volatility 75 Index",   pipSize:0.01,  pipVal:0.10,  contractSize:1,    minLot:0.001,maxLot:10,  stepLot:0.001,type:"SYN"},
+  {id:"v25",  label:"Volatility 25 Index",   pipSize:0.001, pipVal:0.10,  contractSize:1,    minLot:0.001,maxLot:10,  stepLot:0.001,type:"SYN"},
+  {id:"v10",  label:"Volatility 10 Index",   pipSize:0.001, pipVal:0.10,  contractSize:1,    minLot:0.001,maxLot:10,  stepLot:0.001,type:"SYN"},
+  {id:"v50",  label:"Volatility 50 Index",   pipSize:0.01,  pipVal:0.10,  contractSize:1,    minLot:0.001,maxLot:10,  stepLot:0.001,type:"SYN"},
+  {id:"v100", label:"Volatility 100 Index",  pipSize:0.01,  pipVal:0.10,  contractSize:1,    minLot:0.001,maxLot:10,  stepLot:0.001,type:"SYN"},
+  {id:"cr1k", label:"Crash 1000 Index",      pipSize:0.01,  pipVal:0.10,  contractSize:1,    minLot:0.001,maxLot:10,  stepLot:0.001,type:"SYN"},
+  {id:"bm1k", label:"Boom 1000 Index",       pipSize:0.01,  pipVal:0.10,  contractSize:1,    minLot:0.001,maxLot:10,  stepLot:0.001,type:"SYN"},
+  {id:"cr500",label:"Crash 500 Index",       pipSize:0.01,  pipVal:0.10,  contractSize:1,    minLot:0.001,maxLot:10,  stepLot:0.001,type:"SYN"},
+  {id:"bm500",label:"Boom 500 Index",        pipSize:0.01,  pipVal:0.10,  contractSize:1,    minLot:0.001,maxLot:10,  stepLot:0.001,type:"SYN"},
+  {id:"eu",   label:"EUR/USD",               pipSize:0.0001,pipVal:10.00, contractSize:100000,minLot:0.01, maxLot:100, stepLot:0.01, type:"FX"},
+  {id:"gu",   label:"GBP/USD",               pipSize:0.0001,pipVal:10.00, contractSize:100000,minLot:0.01, maxLot:100, stepLot:0.01, type:"FX"},
+  {id:"uj",   label:"USD/JPY",               pipSize:0.01,  pipVal:9.20,  contractSize:100000,minLot:0.01, maxLot:100, stepLot:0.01, type:"FX"},
+  {id:"au",   label:"AUD/USD",               pipSize:0.0001,pipVal:10.00, contractSize:100000,minLot:0.01, maxLot:100, stepLot:0.01, type:"FX"},
+];
+
+function MT5Calc({an,mkt}){
+  const matchedInst=MT5_INSTRUMENTS.find(i=>i.id===mkt.id)||MT5_INSTRUMENTS[0];
+  const [inst,setInst]=useState(matchedInst.id);
+  const [balance,setBalance]=useState(500);
+  const [riskPct,setRiskPct]=useState(2);
+  const [entryP,setEntryP]=useState(an?an.entry.toFixed(2):"");
+  const [slP,setSlP]=useState(an?an.stopL.toFixed(2):"");
+  const [tp1P,setTp1P]=useState(an?an.tp1.toFixed(2):"");
+  const [tp2P,setTp2P]=useState(an?an.tp2.toFixed(2):"");
+  const [dir,setDir]=useState(an?an.dir:"BUY");
+
+  // Auto-fill from engine signal when tab loads
+  useEffect(()=>{
+    if(an){
+      setEntryP(an.entry.toFixed(an.price>10?2:5));
+      setSlP(an.stopL.toFixed(an.price>10?2:5));
+      setTp1P(an.tp1.toFixed(an.price>10?2:5));
+      setTp2P(an.tp2.toFixed(an.price>10?2:5));
+      setDir(an.dir);
+      const m=MT5_INSTRUMENTS.find(i=>i.id===mkt.id);
+      if(m)setInst(m.id);
+    }
+  },[an,mkt]);
+
+  const selInst=MT5_INSTRUMENTS.find(i=>i.id===inst)||MT5_INSTRUMENTS[0];
+  const entry=parseFloat(entryP)||0;
+  const sl=parseFloat(slP)||0;
+  const tp1=parseFloat(tp1P)||0;
+  const tp2=parseFloat(tp2P)||0;
+
+  // Core calculations
+  const slPips=entry&&sl?Math.abs(entry-sl)/selInst.pipSize:0;
+  const tp1Pips=entry&&tp1?Math.abs(tp1-entry)/selInst.pipSize:0;
+  const tp2Pips=entry&&tp2?Math.abs(tp2-entry)/selInst.pipSize:0;
+  const riskAmount=(balance*riskPct)/100;
+  const lotSize=slPips>0&&selInst.pipVal>0?riskAmount/(slPips*selInst.pipVal):0;
+  const adjLot=Math.max(selInst.minLot,Math.min(selInst.maxLot,Math.round(lotSize/selInst.stepLot)*selInst.stepLot));
+  const actualRisk=adjLot*slPips*selInst.pipVal;
+  const tp1Profit=adjLot*tp1Pips*selInst.pipVal;
+  const tp2Profit=adjLot*tp2Pips*selInst.pipVal;
+  const rr1=actualRisk>0?tp1Profit/actualRisk:0;
+  const rr2=actualRisk>0?tp2Profit/actualRisk:0;
+  const marginNeeded=selInst.type==="FX"?adjLot*selInst.contractSize*entry/100:adjLot*entry*0.01;
+
+  const inp={background:"#060f1a",border:"1px solid #1e2d3d",borderRadius:4,color:"#c8ddf0",padding:"7px 10px",width:"100%",fontSize:12,outline:"none"};
+  const lbl={color:"#4a6080",fontSize:9,textTransform:"uppercase",letterSpacing:1,marginBottom:3,display:"block"};
+  const col=dir==="BUY"?"#00e59b":"#ff4d6d";
+
+  return(
+    <div>
+      {/* Auto-fill notice */}
+      {an&&<div style={{background:"rgba(0,229,155,0.05)",border:"1px solid rgba(0,229,155,0.2)",borderRadius:6,padding:"8px 12px",marginBottom:14,fontSize:10,color:"#00e59b"}}>
+        ✓ Auto-filled from engine signal — {mkt.full} · {an.dir} · Confidence {an.conf}%
+      </div>}
+
+      {/* Instrument selector */}
+      <div style={{background:"#0a1929",border:"1px solid #0e2235",borderRadius:8,padding:14,marginBottom:12}}>
+        <div style={{color:"#4a6080",fontSize:10,fontWeight:700,letterSpacing:2,textTransform:"uppercase",marginBottom:10}}>Select Instrument</div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6,marginBottom:10}}>
+          <div>
+            <label style={lbl}>Instrument</label>
+            <select style={{...inp,cursor:"pointer"}} value={inst} onChange={e=>setInst(e.target.value)}>
+              <optgroup label="── SYNTHETIC ──">
+                {MT5_INSTRUMENTS.filter(i=>i.type==="SYN").map(i=><option key={i.id} value={i.id}>{i.label}</option>)}
+              </optgroup>
+              <optgroup label="── FOREX ──">
+                {MT5_INSTRUMENTS.filter(i=>i.type==="FX").map(i=><option key={i.id} value={i.id}>{i.label}</option>)}
+              </optgroup>
+            </select>
+          </div>
+          <div>
+            <label style={lbl}>Direction</label>
+            <select style={{...inp,cursor:"pointer",color:dir==="BUY"?"#00e59b":"#ff4d6d",fontWeight:700}} value={dir} onChange={e=>setDir(e.target.value)}>
+              <option value="BUY">BUY (Rise)</option>
+              <option value="SELL">SELL (Fall)</option>
+            </select>
+          </div>
+        </div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:6,fontSize:10}}>
+          {[
+            {lb:"Pip Size",v:selInst.pipSize},
+            {lb:"Pip Value ($)",v:"$"+selInst.pipVal.toFixed(2)},
+            {lb:"Min Lot",v:selInst.minLot},
+          ].map(({lb,v})=>(
+            <div key={lb} style={{background:"#060f1a",border:"1px solid #0e2235",borderRadius:5,padding:"6px 8px"}}>
+              <div style={{color:"#2a3f55",fontSize:9,marginBottom:2}}>{lb}</div>
+              <div style={{color:"#8aa0b8",fontWeight:700}}>{v}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Price levels */}
+      <div style={{background:"#0a1929",border:"1px solid #0e2235",borderRadius:8,padding:14,marginBottom:12}}>
+        <div style={{color:"#4a6080",fontSize:10,fontWeight:700,letterSpacing:2,textTransform:"uppercase",marginBottom:10}}>Price Levels (from MT5 chart)</div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+          <div>
+            <label style={{...lbl,color:col}}>Entry Price</label>
+            <input style={{...inp,borderColor:col+"50"}} type="number" step="any" value={entryP} onChange={e=>setEntryP(e.target.value)} placeholder="e.g. 1198.50"/>
+          </div>
+          <div>
+            <label style={{...lbl,color:"#ff4d6d"}}>Stop Loss</label>
+            <input style={{...inp,borderColor:"#ff4d6d50"}} type="number" step="any" value={slP} onChange={e=>setSlP(e.target.value)} placeholder="e.g. 1185.00"/>
+          </div>
+          <div>
+            <label style={{...lbl,color:"#00e59b"}}>Take Profit 1</label>
+            <input style={{...inp,borderColor:"#00e59b50"}} type="number" step="any" value={tp1P} onChange={e=>setTp1P(e.target.value)} placeholder="e.g. 1220.00"/>
+          </div>
+          <div>
+            <label style={{...lbl,color:"#00aaff"}}>Take Profit 2</label>
+            <input style={{...inp,borderColor:"#00aaff50"}} type="number" step="any" value={tp2P} onChange={e=>setTp2P(e.target.value)} placeholder="e.g. 1240.00"/>
+          </div>
+        </div>
+      </div>
+
+      {/* Account settings */}
+      <div style={{background:"#0a1929",border:"1px solid #0e2235",borderRadius:8,padding:14,marginBottom:12}}>
+        <div style={{color:"#4a6080",fontSize:10,fontWeight:700,letterSpacing:2,textTransform:"uppercase",marginBottom:10}}>Account Settings</div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+          <div>
+            <label style={lbl}>Account Balance ($)</label>
+            <input style={inp} type="number" value={balance} onChange={e=>setBalance(+e.target.value||500)} placeholder="500"/>
+          </div>
+          <div>
+            <label style={lbl}>Risk per Trade (%)</label>
+            <div style={{display:"flex",gap:4}}>
+              {[1,2,3,5].map(v=>(
+                <button key={v} onClick={()=>setRiskPct(v)} style={{flex:1,padding:"7px 0",borderRadius:4,border:"none",cursor:"pointer",fontSize:11,fontWeight:700,background:riskPct===v?"linear-gradient(135deg,#00e59b,#00aaff)":"#060f1a",color:riskPct===v?"#000":"#4a6080"}}>
+                  {v}%
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Results */}
+      {entry>0&&sl>0&&slPips>0?(
+        <div>
+          {/* Main result */}
+          <div style={{background:col+"0d",border:`2px solid ${col}40`,borderRadius:8,padding:16,marginBottom:12,textAlign:"center"}}>
+            <div style={{color:"#4a6080",fontSize:10,marginBottom:6,textTransform:"uppercase",letterSpacing:2}}>Recommended Lot Size</div>
+            <div style={{color:col,fontSize:36,fontWeight:700,fontFamily:"monospace"}}>{adjLot.toFixed(3)}</div>
+            <div style={{color:"#4a6080",fontSize:10,marginTop:4}}>lots · {selInst.label}</div>
+          </div>
+
+          {/* Stats grid */}
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:12}}>
+            {[
+              {lb:"SL Distance",v:slPips.toFixed(1)+" pips",c:"#ff4d6d"},
+              {lb:"Max Risk $",v:"$"+actualRisk.toFixed(2),c:"#ff4d6d"},
+              {lb:"Risk %",v:riskPct+"%",c:"#f0c040"},
+              {lb:"Risk Amount",v:"$"+riskAmount.toFixed(2),c:"#f0c040"},
+              {lb:"TP1 Distance",v:tp1Pips.toFixed(1)+" pips",c:"#00e59b"},
+              {lb:"TP1 Profit $",v:"$"+tp1Profit.toFixed(2),c:"#00e59b"},
+              {lb:"TP2 Distance",v:tp2Pips.toFixed(1)+" pips",c:"#00aaff"},
+              {lb:"TP2 Profit $",v:"$"+tp2Profit.toFixed(2),c:"#00aaff"},
+              {lb:"R:R to TP1",v:"1 : "+rr1.toFixed(2),c:rr1>=2?"#00e59b":"#f0c040"},
+              {lb:"R:R to TP2",v:"1 : "+rr2.toFixed(2),c:rr2>=2?"#00e59b":"#f0c040"},
+              {lb:"Margin Est.",v:"$"+marginNeeded.toFixed(2),c:"#8aa0b8"},
+              {lb:"Pip Value",v:"$"+selInst.pipVal.toFixed(2),c:"#8aa0b8"},
+            ].map(({lb,v,c})=>(
+              <div key={lb} style={{background:"#060f1a",border:"1px solid #0e2235",borderRadius:6,padding:"8px 10px"}}>
+                <div style={{color:"#2a3f55",fontSize:9,textTransform:"uppercase",letterSpacing:1,marginBottom:3}}>{lb}</div>
+                <div style={{color:c,fontSize:13,fontWeight:700}}>{v}</div>
+              </div>
+            ))}
+          </div>
+
+          {/* MT5 Order Instructions */}
+          <div style={{background:"#060f1a",border:"1px solid #1a3050",borderRadius:8,padding:14,marginBottom:12}}>
+            <div style={{color:"#00e59b",fontSize:10,fontWeight:700,letterSpacing:2,textTransform:"uppercase",marginBottom:10}}>HOW TO PLACE ON MT5</div>
+            <div style={{color:"#8aa0b8",fontSize:11,lineHeight:2.1}}>
+              1. Open MT5 → tap <strong style={{color:"#c8ddf0"}}>{selInst.label}</strong><br/>
+              2. Tap <strong style={{color:col}}>{dir==="BUY"?"BUY (Blue button)":"SELL (Red button)"}</strong><br/>
+              3. Set Volume (Lot size): <strong style={{color:"#f0c040"}}>{adjLot.toFixed(3)}</strong><br/>
+              4. Set Stop Loss: <strong style={{color:"#ff4d6d"}}>{slP||"—"}</strong><br/>
+              5. Set Take Profit: <strong style={{color:"#00e59b"}}>{tp1P||"—"}</strong><br/>
+              6. Tap <strong style={{color:"#c8ddf0"}}>Place Order</strong> when price is near <strong style={{color:col}}>{entryP||"—"}</strong>
+            </div>
+          </div>
+
+          {/* Risk rating */}
+          <div style={{padding:"10px 14px",background:rr1>=2?"rgba(0,229,155,0.05)":rr1>=1?"rgba(240,192,64,0.05)":"rgba(255,77,109,0.05)",border:`1px solid ${rr1>=2?"rgba(0,229,155,0.2)":rr1>=1?"rgba(240,192,64,0.2)":"rgba(255,77,109,0.2)"}`,borderRadius:6,fontSize:11,color:rr1>=2?"#00e59b":rr1>=1?"#f0c040":"#ff4d6d",lineHeight:1.7}}>
+            {rr1>=2?"✅ Good R:R ratio — this is a solid trade setup. Your potential reward is "+rr1.toFixed(1)+"x your risk.":rr1>=1?"⚠️ Acceptable R:R ratio but consider waiting for a better setup with R:R above 2.":"❌ Poor R:R ratio — you risk more than you gain. Avoid this setup or move your SL closer."}
+          </div>
+        </div>
+      ):(
+        <div style={{background:"#0a1929",border:"1px solid #0e2235",borderRadius:8,padding:30,textAlign:"center"}}>
+          <div style={{fontSize:28,marginBottom:10}}>🧮</div>
+          <div style={{color:"#4a6080",fontSize:12}}>Fill in Entry and Stop Loss prices above to calculate lot size and risk</div>
+          {an&&<div style={{color:"#00e59b",fontSize:10,marginTop:8}}>✓ Prices auto-filled from engine — just review and confirm</div>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Candle Forecast Engine ────────────────────────────────────────────────────
+function forecastCandles(candles, count=10){
+  if(candles.length<30) return null;
+  const closes=candles.map(c=>c.close);
+  const highs=candles.map(c=>c.high);
+  const lows=candles.map(c=>c.low);
+  const rsiV=calcRSI(closes);
+  const {ml,sl:sigL,h:hist}=calcMACD(closes);
+  const bollV=calcBoll(closes);
+  const atrV=calcATR(candles);
+  const {k:stK}=calcStoch(candles);
+  const e9=ema(closes,9),e20=ema(closes,20);
+  const last=closes.length-1;
+  const lATR=atrV[last]||1;
+  const lRSI=rsiV[last]||50;
+  const lBoll=bollV[last];
+  const lE9=e9[last],lE20=e20[last];
+  const lH=hist[last],pH=hist[last-1];
+  const lStK=stK[last]||50;
+  const price=closes[last];
+
+  // Momentum score: positive = bullish, negative = bearish
+  let momentum=0;
+  if(lE9>lE20) momentum+=2; else momentum-=2;
+  if(lRSI>50) momentum+=1; else momentum-=1;
+  if(lH!=null&&lH>0) momentum+=2; else if(lH!=null) momentum-=2;
+  if(lBoll.mid&&price>lBoll.mid) momentum+=1; else momentum-=1;
+  if(lStK>50) momentum+=1; else momentum-=1;
+
+  // Recent candle bias (last 5 candles direction)
+  const recent5=candles.slice(-5);
+  const bullCandles=recent5.filter(c=>c.close>c.open).length;
+  const bearCandles=5-bullCandles;
+  if(bullCandles>bearCandles) momentum+=1.5; else momentum-=1.5;
+
+  // Velocity: rate of change over last 3 candles
+  const velocity=(closes[last]-closes[last-3])/closes[last-3]*100;
+
+  // Decay factor — further candles are less certain
+  const forecasts=[];
+  let runningMomentum=momentum;
+  let runningPrice=price;
+
+  for(let i=1;i<=count;i++){
+    // Momentum decays slightly each candle
+    const decay=0.85;
+    runningMomentum*=decay;
+
+    // Add slight mean reversion pressure
+    if(lBoll.upper&&lBoll.lower){
+      const pctB=(runningPrice-lBoll.lower)/(lBoll.upper-lBoll.lower);
+      if(pctB>0.8) runningMomentum-=0.5;
+      if(pctB<0.2) runningMomentum+=0.5;
+    }
+
+    const dir=runningMomentum>=0?"BUY":"SELL";
+    const absMom=Math.abs(runningMomentum);
+    const rawConf=Math.min(92,Math.max(35,50+absMom*6));
+    const conf=Math.round(rawConf);
+
+    // Estimated price move
+    const movePct=(absMom/10)*lATR;
+    const estClose=dir==="BUY"?runningPrice+movePct:runningPrice-movePct;
+
+    // Time: each candle = 5 mins
+    const mins=i*5;
+    const timeLabel=mins>=60?`${Math.floor(mins/60)}h${mins%60>0?mins%60+"m":""}`:`${mins}m`;
+
+    forecasts.push({
+      candle:i,
+      dir,
+      conf,
+      timeLabel,
+      estPrice:estClose,
+      strong:conf>=70,
+    });
+
+    runningPrice=estClose;
+  }
+
+  // Overall bias for 15min (3 candles) and 30min (6 candles)
+  const next3=forecasts.slice(0,3);
+  const next6=forecasts.slice(0,6);
+  const bias3=next3.filter(f=>f.dir==="BUY").length>next3.filter(f=>f.dir==="SELL").length?"BUY":"SELL";
+  const bias6=next6.filter(f=>f.dir==="BUY").length>next6.filter(f=>f.dir==="SELL").length?"BUY":"SELL";
+  const conf3=Math.round(next3.reduce((s,f)=>s+f.conf,0)/3);
+  const conf6=Math.round(next6.reduce((s,f)=>s+f.conf,0)/6);
+
+  // Best entry window — first candle where 3 consecutive agree
+  let bestEntry=null;
+  for(let i=0;i<forecasts.length-2;i++){
+    if(forecasts[i].dir===forecasts[i+1].dir&&forecasts[i+1].dir===forecasts[i+2].dir&&forecasts[i].conf>=60){
+      bestEntry={candle:forecasts[i].candle,dir:forecasts[i].dir,time:forecasts[i].timeLabel};
+      break;
+    }
+  }
+
+  return{forecasts,bias3,bias6,conf3,conf6,bestEntry,velocity,momentum,price};
+}
+
+function ForecastPanel({candles,mkt}){
+  const fc=forecastCandles(candles,10);
+  if(!fc) return(<div style={{padding:40,textAlign:"center",color:"#2a3f55",fontSize:12}}>Need 30+ candles to generate forecast</div>);
+
+  const bias3Col=fc.bias3==="BUY"?"#00e59b":"#ff4d6d";
+  const bias6Col=fc.bias6==="BUY"?"#00e59b":"#ff4d6d";
+  const fmt=v=>v.toFixed(v>10?2:5);
+
+  return(
+    <div>
+      {/* Disclaimer */}
+      <div style={{background:"rgba(0,170,255,0.06)",border:"1px solid rgba(0,170,255,0.2)",borderRadius:6,padding:"8px 12px",marginBottom:14,fontSize:10,color:"#00aaff",lineHeight:1.7}}>
+        📌 Forecast is based on current momentum, trend, RSI, MACD and Bollinger data. Each candle = 5 minutes. Use this for 15min and 30min trade setup planning — not as a guarantee.
+      </div>
+
+      {/* 15min and 30min bias */}
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:14}}>
+        <div style={{background:bias3Col+"0d",border:`2px solid ${bias3Col}40`,borderRadius:8,padding:14,textAlign:"center"}}>
+          <div style={{color:"#4a6080",fontSize:9,textTransform:"uppercase",letterSpacing:2,marginBottom:6}}>Next 15 Minutes</div>
+          <div style={{color:bias3Col,fontSize:22,fontWeight:700}}>{fc.bias3==="BUY"?"▲ BUY":"▼ SELL"}</div>
+          <div style={{color:bias3Col,fontSize:13,fontWeight:700,marginTop:4}}>{fc.conf3}% confidence</div>
+          <div style={{color:"#2a3f55",fontSize:9,marginTop:4}}>3 candles · {mkt.full}</div>
+        </div>
+        <div style={{background:bias6Col+"0d",border:`2px solid ${bias6Col}40`,borderRadius:8,padding:14,textAlign:"center"}}>
+          <div style={{color:"#4a6080",fontSize:9,textTransform:"uppercase",letterSpacing:2,marginBottom:6}}>Next 30 Minutes</div>
+          <div style={{color:bias6Col,fontSize:22,fontWeight:700}}>{fc.bias6==="BUY"?"▲ BUY":"▼ SELL"}</div>
+          <div style={{color:bias6Col,fontSize:13,fontWeight:700,marginTop:4}}>{fc.conf6}% confidence</div>
+          <div style={{color:"#2a3f55",fontSize:9,marginTop:4}}>6 candles · {mkt.full}</div>
+        </div>
+      </div>
+
+      {/* Best entry window */}
+      {fc.bestEntry&&(
+        <div style={{background:"rgba(240,192,64,0.06)",border:"1px solid rgba(240,192,64,0.25)",borderRadius:8,padding:12,marginBottom:14,display:"flex",alignItems:"center",gap:12}}>
+          <div style={{fontSize:24}}>⚡</div>
+          <div>
+            <div style={{color:"#f0c040",fontSize:11,fontWeight:700,marginBottom:3}}>BEST ENTRY WINDOW</div>
+            <div style={{color:"#8aa0b8",fontSize:11}}>Candle #{fc.bestEntry.candle} · In {fc.bestEntry.time} · <strong style={{color:fc.bestEntry.dir==="BUY"?"#00e59b":"#ff4d6d"}}>{fc.bestEntry.dir}</strong> direction — 3 consecutive candles agree</div>
+          </div>
+        </div>
+      )}
+
+      {/* Momentum bar */}
+      <div style={{background:"#0a1929",border:"1px solid #0e2235",borderRadius:8,padding:12,marginBottom:14}}>
+        <div style={{display:"flex",justifyContent:"space-between",marginBottom:6}}>
+          <span style={{color:"#4a6080",fontSize:10,textTransform:"uppercase",letterSpacing:1}}>Market Momentum</span>
+          <span style={{color:fc.momentum>=0?"#00e59b":"#ff4d6d",fontSize:10,fontWeight:700}}>{fc.momentum>=0?"BULLISH":"BEARISH"} ({fc.velocity>=0?"+":""}{fc.velocity.toFixed(2)}%)</span>
+        </div>
+        <div style={{height:6,background:"#060f1a",borderRadius:3,overflow:"hidden"}}>
+          <div style={{height:6,width:`${Math.min(100,Math.abs(fc.momentum)/8*100)}%`,background:fc.momentum>=0?"linear-gradient(90deg,#00e59b,#00aaff)":"linear-gradient(90deg,#ff4d6d,#ff9f43)",borderRadius:3,marginLeft:fc.momentum<0?`${100-Math.min(100,Math.abs(fc.momentum)/8*100)}%`:0,transition:"all 0.3s"}}/>
+        </div>
+      </div>
+
+      {/* Candle by candle forecast */}
+      <div style={{background:"#0a1929",border:"1px solid #0e2235",borderRadius:8,overflow:"hidden",marginBottom:14}}>
+        <div style={{padding:"10px 14px",borderBottom:"1px solid #0e2235",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+          <div style={{color:"#4a6080",fontSize:10,fontWeight:700,letterSpacing:2,textTransform:"uppercase"}}>Candle-by-Candle Forecast (Next 10)</div>
+          <div style={{fontSize:9,color:"#2a3f55"}}>Current: {fmt(fc.price)}</div>
+        </div>
+        <div style={{overflowX:"auto"}}>
+          <table style={{width:"100%",borderCollapse:"collapse"}}>
+            <thead>
+              <tr style={{background:"#060f1a"}}>
+                {["Candle","Time","Direction","Confidence","Est. Price","Strength"].map(h=>(
+                  <th key={h} style={{padding:"6px 10px",textAlign:"left",color:"#2a3f55",fontSize:9,textTransform:"uppercase",letterSpacing:1,borderBottom:"1px solid #0e2235"}}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {fc.forecasts.map((f,i)=>{
+                const col=f.dir==="BUY"?"#00e59b":"#ff4d6d";
+                const confCol=f.conf>=70?"#00e59b":f.conf>=55?"#f0c040":"#ff4d6d";
+                return(
+                  <tr key={i} className="slide-in" style={{background:i%2===0?"#060f1a":"transparent",borderLeft:f.strong?`3px solid ${col}`:"3px solid transparent"}}>
+                    <td style={{padding:"7px 10px",color:"#4a6080",fontSize:11}}>#{f.candle}</td>
+                    <td style={{padding:"7px 10px",color:"#4a6080",fontSize:11}}>+{f.timeLabel}</td>
+                    <td style={{padding:"7px 10px"}}>
+                      <span style={{background:col+"15",color:col,padding:"2px 10px",borderRadius:3,fontSize:10,fontWeight:700,border:`1px solid ${col}30`}}>
+                        {f.dir==="BUY"?"▲ BUY":"▼ SELL"}
+                      </span>
+                    </td>
+                    <td style={{padding:"7px 10px",color:confCol,fontSize:11,fontWeight:700}}>{f.conf}%</td>
+                    <td style={{padding:"7px 10px",color:col,fontSize:11,fontWeight:700}}>{fmt(f.estPrice)}</td>
+                    <td style={{padding:"7px 10px"}}>
+                      <span style={{fontSize:10,color:f.strong?"#00e59b":"#4a6080"}}>{f.strong?"● STRONG":"○ WEAK"}</span>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* How to use */}
+      <div style={{background:"#060f1a",border:"1px solid #1a3050",borderRadius:8,padding:14}}>
+        <div style={{color:"#00e59b",fontSize:10,fontWeight:700,letterSpacing:2,textTransform:"uppercase",marginBottom:10}}>HOW TO USE THIS FOR 15MIN / 30MIN TRADES</div>
+        <div style={{color:"#8aa0b8",fontSize:11,lineHeight:2}}>
+          1. Check the <strong style={{color:"#c8ddf0"}}>15 Min bias</strong> and <strong style={{color:"#c8ddf0"}}>30 Min bias</strong> above<br/>
+          2. If both agree on same direction — that's your trade direction<br/>
+          3. Look at <strong style={{color:"#f0c040"}}>Best Entry Window</strong> — wait for that candle<br/>
+          4. Only enter if confidence is <strong style={{color:"#00e59b"}}>above 65%</strong><br/>
+          5. Go to <strong style={{color:"#c8ddf0"}}>SIGNAL tab</strong> for exact entry price, SL and TP<br/>
+          6. On MT5 — set expiry to <strong style={{color:"#c8ddf0"}}>15 or 30 minutes</strong>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Main App ──────────────────────────────────────────────────────────────────
+function App(){
+  const [mkt,setMkt]=useState(MARKETS[0]);
+  const [data,setData]=useState({});
+  const [stake,setStake]=useState(30);
+  const [tab,setTab]=useState("signal");
+  const [sim,setSim]=useState(false);
+  const [updated,setUpdated]=useState(new Date());
+  const [filter,setFilter]=useState("ALL");
+  const timerRef=useRef(null);
+
+  useEffect(()=>{
+    const init={};
+    MARKETS.forEach(m=>{init[m.id]=genCandles(m.base,80,m.vol);});
+    setData(init);
+  },[]);
+
+  const candles=data[mkt.id]||[];
+  const an=candles.length>=30?analyze(candles,stake):null;
+
+  const addCandle=c=>{
+    setData(p=>({...p,[mkt.id]:[...(p[mkt.id]||[]).slice(-99),c]}));
+    setUpdated(new Date());
+  };
+
+  const simCandle=useCallback(()=>{
+    setData(p=>{
+      const curr=p[mkt.id]||[];
+      if(!curr.length)return p;
+      const last=curr[curr.length-1];
+      const mv=(Math.random()-0.49)*last.close*mkt.vol;
+      const o=last.close,c=o+mv,rng=Math.abs(mv)*(1.5+Math.random());
+      return{...p,[mkt.id]:[...curr.slice(-99),{open:o,high:Math.max(o,c)+rng*0.3,low:Math.min(o,c)-rng*0.3,close:c,time:new Date()}]};
+    });
+    setUpdated(new Date());
+  },[mkt]);
+
+  useEffect(()=>{
+    if(sim)timerRef.current=setInterval(simCandle,4000);
+    else clearInterval(timerRef.current);
+    return()=>clearInterval(timerRef.current);
+  },[sim,simCandle]);
+
+  const reset=()=>{setData(p=>({...p,[mkt.id]:genCandles(mkt.base,80,mkt.vol)}));setUpdated(new Date());};
+
+  const dirCol=an?(an.wait?"#f0c040":an.isSqueeze?"#00aaff":an.dir==="BUY"?"#00e59b":"#ff4d6d"):"#4a6080";
+
+  const synMarkets=MARKETS.filter(m=>m.type==="SYN");
+  const fxMarkets=MARKETS.filter(m=>m.type==="FX");
+  const showMarkets=filter==="FX"?fxMarkets:filter==="SYN"?synMarkets:MARKETS;
+
+  const nb=a=>({padding:"8px 16px",cursor:"pointer",border:"none",background:"none",fontSize:11,fontWeight:700,letterSpacing:1,color:a?"#00e59b":"#2a3f55",borderBottom:a?"2px solid #00e59b":"2px solid transparent",marginBottom:-2,whiteSpace:"nowrap"});
+
+  return(
+    <div style={{minHeight:"100vh",background:"#060f1a",color:"#c8ddf0",paddingBottom:60}}>
+
+      {/* Header */}
+      <div style={{background:"linear-gradient(180deg,#0a1929,#060f1a)",borderBottom:"1px solid #0e2235",padding:"0 14px"}}>
+        <div style={{display:"flex",alignItems:"center",gap:10,padding:"12px 0 8px"}}>
+          <svg width="22" height="22" viewBox="0 0 28 28">
+            <polygon points="14,2 26,24 2,24" fill="none" stroke="#00e59b" strokeWidth="2.5"/>
+            <polygon points="14,8 21,20 7,20" fill="#00e59b" opacity="0.4"/>
+          </svg>
+          <span style={{fontSize:15,fontWeight:700}}>DERIV<span style={{color:"#00e59b"}}>ENGINE</span></span>
+          <span style={{fontSize:9,color:"#2a3f55",background:"#0e2235",padding:"2px 6px",borderRadius:3}}>v2.1</span>
+          <div style={{flex:1}}/>
+          <div className={sim?"pulse":""} style={{width:7,height:7,borderRadius:"50%",background:sim?"#00e59b":"#2a3f55"}}/>
+          <span style={{fontSize:9,color:"#2a3f55"}}>{sim?"LIVE SIM":"MANUAL"}</span>
+        </div>
+
+        {/* Market filter */}
+        <div style={{display:"flex",gap:4,marginBottom:6}}>
+          {["ALL","SYN","FX"].map(f=>(
+            <button key={f} onClick={()=>setFilter(f)} style={{padding:"3px 10px",borderRadius:3,border:"none",fontSize:9,fontWeight:700,cursor:"pointer",background:filter===f?"#0e2235":"transparent",color:filter===f?"#00e59b":"#2a3f55",borderBottom:filter===f?"1px solid #00e59b":"1px solid transparent"}}>
+              {f==="SYN"?"SYNTHETIC":f==="FX"?"FOREX":"ALL MARKETS"}
+            </button>
+          ))}
+          <div style={{flex:1}}/>
+          <button onClick={()=>setSim(p=>!p)} style={{padding:"3px 8px",borderRadius:3,border:"none",fontSize:9,fontWeight:700,cursor:"pointer",background:sim?"rgba(0,229,155,0.1)":"#0e2235",color:sim?"#00e59b":"#4a6080"}}>
+            {sim?"⏹ STOP":"▶ LIVE SIM"}
+          </button>
+          <button onClick={reset} style={{padding:"3px 8px",borderRadius:3,border:"none",fontSize:9,cursor:"pointer",background:"#0e2235",color:"#4a6080"}}>RESET</button>
+        </div>
+
+        {/* Market tabs */}
+        <div style={{display:"flex",gap:3,overflowX:"auto",paddingBottom:0,flexWrap:"wrap"}}>
+          {showMarkets.map(m=>{
+            const mAn=data[m.id]&&data[m.id].length>=30?analyze(data[m.id],stake):null;
+            const mCol=mAn?(mAn.wait?"#f0c040":mAn.dir==="BUY"?"#00e59b":"#ff4d6d"):m.color;
+            return(
+              <button key={m.id} onClick={()=>setMkt(m)} style={{padding:"5px 10px",borderRadius:"4px 4px 0 0",border:"none",cursor:"pointer",fontSize:10,fontWeight:700,whiteSpace:"nowrap",background:m.id===mkt.id?"#0e2235":"transparent",color:m.id===mkt.id?mCol:"#2a3f55",borderTop:m.id===mkt.id?`2px solid ${mCol}`:"2px solid transparent"}}>
+                {m.label} {mAn&&!mAn.wait?<span style={{fontSize:8}}>{mAn.dir==="BUY"?"▲":"▼"}</span>:null}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* Signal banner */}
+      <div style={{background:dirCol+"10",borderBottom:`1px solid ${dirCol}25`,padding:"8px 14px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+        <div>
+          <span style={{color:dirCol,fontSize:13,fontWeight:700}}>
+            {an?(an.wait?"⏳ WAIT — No Clear Setup":an.isSqueeze?"🔥 SQUEEZE — Breakout Coming":an.dir==="BUY"?"▲ BUY / RISE SIGNAL":"▼ SELL / FALL SIGNAL"):"⏳ Loading data..."}
+          </span>
+          {an&&!an.wait&&!an.isSqueeze&&<span style={{color:"#4a6080",fontSize:9,marginLeft:8}}>{an.eType} · {an.conf}% confidence</span>}
+        </div>
+        <span style={{fontSize:9,color:"#2a3f55"}}>{updated.toLocaleTimeString()}</span>
+      </div>
+
+      {/* Tabs */}
+      <div style={{display:"flex",borderBottom:"2px solid #0e2235",padding:"0 14px",overflowX:"auto"}}>
+        <button style={nb(tab==="signal")} onClick={()=>setTab("signal")}>SIGNAL</button>
+        <button style={nb(tab==="forecast")} onClick={()=>setTab("forecast")}>📅 FORECAST</button>
+        <button style={nb(tab==="chart")} onClick={()=>setTab("chart")}>CHART</button>
+        <button style={nb(tab==="indicators")} onClick={()=>setTab("indicators")}>INDICATORS</button>
+        <button style={nb(tab==="signals")} onClick={()=>setTab("signals")}>ALL SIGNALS</button>
+        <button style={nb(tab==="input")} onClick={()=>setTab("input")}>INPUT DATA</button>
+        <button style={nb(tab==="mt5")} onClick={()=>setTab("mt5")}>MT5 CALC</button>
+      </div>
+
+      <div style={{padding:"14px"}}>
+
+        {/* FORECAST TAB */}
+        {tab==="forecast"&&(
+          <div>
+            <ForecastPanel candles={candles} mkt={mkt}/>
+          </div>
+        )}
+
+        {/* SIGNAL TAB */}
+        {tab==="signal"&&(
+          <div>
+            <div style={{background:"#0a1929",border:"1px solid #0e2235",borderRadius:8,padding:16,marginBottom:14}}>
+              <EntryCard an={an} market={mkt} stake={stake}/>
+            </div>
+            {/* Stake setter */}
+            <div style={{background:"#0a1929",border:"1px solid #0e2235",borderRadius:8,padding:14}}>
+              <div style={{color:"#4a6080",fontSize:10,fontWeight:700,letterSpacing:2,textTransform:"uppercase",marginBottom:10}}>Your Stake Size</div>
+              <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                {[10,20,30,40,50].map(v=>(
+                  <button key={v} onClick={()=>setStake(v)} style={{padding:"6px 14px",borderRadius:4,border:"none",cursor:"pointer",fontSize:12,fontWeight:700,background:stake===v?"linear-gradient(135deg,#00e59b,#00aaff)":v===stake?"#0e2235":"#0e2235",color:stake===v?"#000":"#4a6080"}}>
+                    ${v}
+                  </button>
+                ))}
+                <div style={{display:"flex",alignItems:"center",gap:6,marginLeft:4}}>
+                  <span style={{color:"#2a3f55",fontSize:10}}>Custom:</span>
+                  <input type="number" value={stake} onChange={e=>setStake(+e.target.value||30)} style={{background:"#060f1a",border:"1px solid #1e2d3d",borderRadius:4,color:"#c8ddf0",padding:"5px 8px",width:60,fontSize:12,outline:"none"}}/>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* CHART TAB */}
+        {tab==="chart"&&(
+          <div style={{background:"#0a1929",border:"1px solid #0e2235",borderRadius:8,padding:14}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+              <div style={{color:"#4a6080",fontSize:10,fontWeight:700,letterSpacing:2,textTransform:"uppercase"}}>{mkt.full} — 5M Chart</div>
+              <div style={{fontSize:9,color:"#2a3f55"}}>{candles.length} candles · EMA9 <span style={{color:"#00aaff"}}>●</span> EMA20 <span style={{color:"#f0c040"}}>●</span> BB <span style={{color:"#00aaff"}}>- -</span></div>
+            </div>
+            <div style={{background:"#060f1a",borderRadius:6,overflow:"hidden",padding:"8px 4px"}}>
+              <Chart candles={candles} an={an}/>
+            </div>
+            {an&&(
+              <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:6,marginTop:10}}>
+                {[
+                  {lb:"Entry",v:an.entry.toFixed(an.price>10?2:5),c:an.dir==="BUY"?"#00e59b":"#ff4d6d"},
+                  {lb:"TP1",v:an.tp1.toFixed(an.price>10?2:5),c:"#00e59b"},
+                  {lb:"SL",v:an.stopL.toFixed(an.price>10?2:5),c:"#ff4d6d"},
+                ].map(({lb,v,c})=>(
+                  <div key={lb} style={{background:"#060f1a",border:"1px solid #0e2235",borderRadius:5,padding:"6px 8px",textAlign:"center"}}>
+                    <div style={{color:"#2a3f55",fontSize:9,marginBottom:2}}>{lb}</div>
+                    <div style={{color:c,fontSize:11,fontWeight:700}}>{v}</div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* INDICATORS TAB */}
+        {tab==="indicators"&&(
+          <div style={{background:"#0a1929",border:"1px solid #0e2235",borderRadius:8,padding:14}}>
+            <div style={{color:"#4a6080",fontSize:10,fontWeight:700,letterSpacing:2,textTransform:"uppercase",marginBottom:12}}>Live Indicator Readings</div>
+            <IndicatorsPanel an={an}/>
+          </div>
+        )}
+
+        {/* ALL SIGNALS TAB */}
+        {tab==="signals"&&(
+          <div style={{background:"#0a1929",border:"1px solid #0e2235",borderRadius:8,padding:14}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+              <div style={{color:"#4a6080",fontSize:10,fontWeight:700,letterSpacing:2,textTransform:"uppercase"}}>Active Signals ({an?.sigs?.length||0})</div>
+              {an&&<div style={{display:"flex",gap:8}}>
+                <span style={{color:"#00e59b",fontSize:10}}>BUY: {an.buyS}pts</span>
+                <span style={{color:"#ff4d6d",fontSize:10}}>SELL: {an.sellS}pts</span>
+              </div>}
+            </div>
+            <SignalsList sigs={an?.sigs}/>
+          </div>
+        )}
+
+        {/* INPUT TAB */}
+        {tab==="input"&&(
+          <div>
+            <div style={{background:"#0a1929",border:"1px solid #0e2235",borderRadius:8,padding:14,marginBottom:14}}>
+              <div style={{color:"#4a6080",fontSize:10,fontWeight:700,letterSpacing:2,textTransform:"uppercase",marginBottom:4}}>Add Real Candle from Deriv</div>
+              <div style={{color:"#2a3f55",fontSize:10,marginBottom:12}}>Copy Open/High/Low/Close from your Deriv chart and enter below</div>
+              <CandleForm onAdd={addCandle} lastClose={candles.length?candles[candles.length-1].close:mkt.base}/>
+              <div style={{marginTop:8,color:"#2a3f55",fontSize:10}}>{candles.length} candles loaded · Min needed: 30 · Current: {mkt.full}</div>
+            </div>
+            <div style={{background:"#0a1929",border:"1px solid #0e2235",borderRadius:8,padding:14}}>
+              <div style={{color:"#4a6080",fontSize:10,fontWeight:700,letterSpacing:2,textTransform:"uppercase",marginBottom:10}}>Recent Candles</div>
+              <div style={{overflowX:"auto"}}>
+                <table style={{width:"100%",borderCollapse:"collapse",fontSize:10}}>
+                  <thead><tr style={{background:"#060f1a"}}>{["Time","Open","High","Low","Close"].map(h=><th key={h} style={{padding:"5px 8px",textAlign:"left",color:"#2a3f55",borderBottom:"1px solid #0e2235"}}>{h}</th>)}</tr></thead>
+                  <tbody>
+                    {candles.slice(-8).reverse().map((c,i)=>{
+                      const up=c.close>=c.open;
+                      return(
+                        <tr key={i} style={{background:i%2===0?"#060f1a":"transparent"}}>
+                          <td style={{padding:"4px 8px",color:"#2a3f55"}}>{c.time.toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"})}</td>
+                          <td style={{padding:"4px 8px",color:"#8aa0b8"}}>{c.open.toFixed(c.open>10?2:5)}</td>
+                          <td style={{padding:"4px 8px",color:"#00e59b"}}>{c.high.toFixed(c.high>10?2:5)}</td>
+                          <td style={{padding:"4px 8px",color:"#ff4d6d"}}>{c.low.toFixed(c.low>10?2:5)}</td>
+                          <td style={{padding:"4px 8px",color:up?"#00e59b":"#ff4d6d",fontWeight:700}}>{c.close.toFixed(c.close>10?2:5)}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* MT5 CALCULATOR TAB */}
+        {tab==="mt5"&&(
+          <div>
+            {/* Header */}
+            <div style={{background:"linear-gradient(135deg,#0a1929,#0d1f30)",border:"1px solid #1a3050",borderRadius:8,padding:14,marginBottom:14,textAlign:"center"}}>
+              <div style={{fontSize:16,fontWeight:700,color:"#00e59b",marginBottom:4}}>MT5 Trading Calculator</div>
+              <div style={{fontSize:11,color:"#4a6080"}}>Calculate exact lot size, risk, and pip values for your MT5 trades on Deriv</div>
+            </div>
+
+            {/* Lot Size Calculator */}
+            <MT5Calc an={an} mkt={mkt}/>
+          </div>
+        )}
+
+        {/* Disclaimer */}
+        <div style={{marginTop:16,padding:"10px 14px",background:"rgba(255,77,109,0.04)",border:"1px solid rgba(255,77,109,0.15)",borderRadius:6}}>
+          <span style={{color:"#ff4d6d",fontSize:10,fontWeight:700}}>⚠ DISCLAIMER: </span>
+          <span style={{color:"#2a3f55",fontSize:10}}>This engine provides analysis only — not financial advice. Synthetic indices carry high risk. Never trade money you cannot afford to lose. Always use stop losses.</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
