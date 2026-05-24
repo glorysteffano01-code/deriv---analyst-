@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>MT5 Chart Analyzer — AI Trading Analysis</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet"/>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0;}
+    body{background:#060f1a;color:#c8ddf0;font-family:'JetBrains Mono',monospace;min-height:100vh;}
+    ::-webkit-scrollbar{width:4px;} ::-webkit-scrollbar-track{background:#060f1a;} ::-webkit-scrollbar-thumb{background:#1e2d3d;border-radius:2px;}
+    @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.3}}
+    @keyframes spin{to{transform:rotate(360deg)}}
+    @keyframes fadeIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+    @keyframes glow{0%,100%{box-shadow:0 0 8px rgba(0,229,155,0.3)}50%{box-shadow:0 0 24px rgba(0,229,155,0.8)}}
+    @keyframes scanline{0%{top:-10%}100%{top:110%}}
+    .fade-in{animation:fadeIn 0.4s ease forwards;}
+    .spin{animation:spin 1s linear infinite;}
+    .pulse{animation:pulse 1.5s infinite;}
+    .glow{animation:glow 2s infinite;}
+  </style>
+</head>
+<body>
+<div id="app"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<script type="text/babel">
+const {useState,useRef,useCallback}=React;
+
+// ── AI Analysis ───────────────────────────────────────────────────────────────
+async function analyzeChart(base64Image, mediaType, timeframe, instrument){
+  const prompt=`You are an expert professional forex and synthetic indices trader analyzing an MT5 chart screenshot.
+
+Instrument: ${instrument}
+Timeframe: ${timeframe}
+
+Carefully analyze this chart and provide a detailed trading analysis. Look at:
+- Candlestick patterns (engulfing, doji, hammer, shooting star, pin bars etc)
+- Trend direction (uptrend, downtrend, sideways)
+- Support and resistance levels visible on the chart
+- Any visible indicators (EMA, RSI, MACD, Bollinger Bands if shown)
+- Price action patterns
+- Overall market structure
+
+Then provide your analysis in this EXACT JSON format (no other text, just JSON):
+{
+  "direction": "BUY" or "SELL" or "WAIT",
+  "confidence": number between 0-95,
+  "entryZone": "price level or range where to enter",
+  "stopLoss": "price level for stop loss",
+  "takeProfit1": "first take profit level",
+  "takeProfit2": "second take profit level",
+  "takeProfit3": "third take profit level",
+  "riskReward": "ratio like 1:2.5",
+  "trend": "BULLISH" or "BEARISH" or "SIDEWAYS",
+  "patternFound": "name of candlestick or chart pattern found",
+  "keyLevels": ["level1", "level2", "level3"],
+  "reasoning": "2-3 sentence explanation of why you recommend this trade",
+  "warnings": "any warnings or things to watch out for",
+  "bestTimeToEnter": "now" or "wait for next candle" or "wait for confirmation",
+  "marketPhase": "trending" or "ranging" or "breakout" or "reversal"
+}`;
+
+  const response=await fetch("https://api.anthropic.com/v1/messages",{
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({
+      model:"claude-sonnet-4-20250514",
+      max_tokens:1000,
+      messages:[{
+        role:"user",
+        content:[
+          {type:"image",source:{type:"base64",media_type:mediaType,data:base64Image}},
+          {type:"text",text:prompt}
+        ]
+      }]
+    })
+  });
+
+  const data=await response.json();
+  const text=data.content.map(i=>i.text||"").join("");
+  const clean=text.replace(/```json|```/g,"").trim();
+  return JSON.parse(clean);
+}
+
+// ── Components ────────────────────────────────────────────────────────────────
+function Header(){
+  return(
+    <div style={{background:"linear-gradient(180deg,#0a1929,#060f1a)",borderBottom:"1px solid #0e2235",padding:"14px 16px"}}>
+      <div style={{display:"flex",alignItems:"center",gap:10}}>
+        <svg width="24" height="24" viewBox="0 0 28 28">
+          <polygon points="14,2 26,24 2,24" fill="none" stroke="#00e59b" strokeWidth="2.5"/>
+          <polygon points="14,8 21,20 7,20" fill="#00e59b" opacity="0.4"/>
+        </svg>
+        <div>
+          <div style={{fontSize:15,fontWeight:700}}>MT5 <span style={{color:"#00e59b"}}>CHART ANALYZER</span></div>
+          <div style={{fontSize:9,color:"#2a3f55",marginTop:1}}>AI-powered trading analysis from your screenshots</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function UploadZone({onImage}){
+  const fileRef=useRef();
+  const [dragging,setDragging]=useState(false);
+
+  const processFile=file=>{
+    if(!file||!file.type.startsWith("image/"))return;
+    const reader=new FileReader();
+    reader.onload=e=>{
+      const dataUrl=e.target.result;
+      const base64=dataUrl.split(",")[1];
+      const mediaType=file.type;
+      onImage({base64,mediaType,preview:dataUrl,name:file.name});
+    };
+    reader.readAsDataURL(file);
+  };
+
+  return(
+    <div
+      onClick={()=>fileRef.current.click()}
+      onDragOver={e=>{e.preventDefault();setDragging(true);}}
+      onDragLeave={()=>setDragging(false)}
+      onDrop={e=>{e.preventDefault();setDragging(false);processFile(e.dataTransfer.files[0]);}}
+      style={{
+        border:`2px dashed ${dragging?"#00e59b":"#1e2d3d"}`,
+        borderRadius:12,padding:"40px 20px",textAlign:"center",cursor:"pointer",
+        background:dragging?"rgba(0,229,155,0.05)":"#0a1929",
+        transition:"all 0.2s",marginBottom:16
+      }}
+    >
+      <div style={{fontSize:40,marginBottom:12}}>📸</div>
+      <div style={{color:"#00e59b",fontSize:13,fontWeight:700,marginBottom:6}}>Upload MT5 Chart Screenshot</div>
+      <div style={{color:"#4a6080",fontSize:11,lineHeight:1.7}}>
+        Take a screenshot of your MT5 chart<br/>
+        and tap here to upload it for AI analysis
+      </div>
+      <div style={{marginTop:14,display:"inline-block",background:"linear-gradient(135deg,#00e59b,#00aaff)",borderRadius:6,padding:"8px 20px",color:"#000",fontSize:11,fontWeight:700}}>
+        📁 Choose Screenshot
+      </div>
+      <input ref={fileRef} type="file" accept="image/*" style={{display:"none"}} onChange={e=>processFile(e.target.files[0])}/>
+    </div>
+  );
+}
+
+function Settings({timeframe,setTimeframe,instrument,setInstrument}){
+  const tfs=["M1","M5","M15","M30","H1","H4","D1"];
+  const insts=["Volatility 75","Volatility 25","Volatility 10","Volatility 50","Volatility 100","Crash 1000","Crash 500","Boom 1000","Boom 500","EUR/USD","GBP/USD","USD/JPY","AUD/USD","XAU/USD"];
+  const inp={background:"#060f1a",border:"1px solid #1e2d3d",borderRadius:4,color:"#c8ddf0",padding:"7px 10px",width:"100%",fontSize:12,outline:"none"};
+  return(
+    <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:16}}>
+      <div>
+        <div style={{color:"#4a6080",fontSize:9,textTransform:"uppercase",letterSpacing:1,marginBottom:4}}>Instrument</div>
+        <select style={{...inp,cursor:"pointer"}} value={instrument} onChange={e=>setInstrument(e.target.value)}>
+          {insts.map(i=><option key={i}>{i}</option>)}
+        </select>
+      </div>
+      <div>
+        <div style={{color:"#4a6080",fontSize:9,textTransform:"uppercase",letterSpacing:1,marginBottom:4}}>Timeframe</div>
+        <select style={{...inp,cursor:"pointer"}} value={timeframe} onChange={e=>setTimeframe(e.target.value)}>
+          {tfs.map(t=><option key={t}>{t}</option>)}
+        </select>
+      </div>
+    </div>
+  );
+}
+
+function LoadingScreen(){
+  return(
+    <div style={{padding:"50px 20px",textAlign:"center"}}>
+      <div style={{width:50,height:50,border:"3px solid #0e2235",borderTop:"3px solid #00e59b",borderRadius:"50%",margin:"0 auto 20px",animation:"spin 1s linear infinite"}}/>
+      <div style={{color:"#00e59b",fontSize:13,fontWeight:700,marginBottom:8}}>AI Analyzing Your Chart...</div>
+      <div style={{color:"#4a6080",fontSize:11,lineHeight:1.8}}>
+        Reading candlestick patterns<br/>
+        Detecting support & resistance<br/>
+        Calculating entry points<br/>
+        Generating trade plan
+      </div>
+      <div style={{marginTop:20,display:"flex",justifyContent:"center",gap:6}}>
+        {[0,1,2].map(i=>(
+          <div key={i} style={{width:8,height:8,borderRadius:"50%",background:"#00e59b",animation:"pulse 1.5s infinite",animationDelay:`${i*0.3}s`}}/>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ResultCard({result,preview}){
+  const col=result.direction==="BUY"?"#00e59b":result.direction==="SELL"?"#ff4d6d":"#f0c040";
+  const confCol=result.confidence>=70?"#00e59b":result.confidence>=50?"#f0c040":"#ff4d6d";
+  const trendCol=result.trend==="BULLISH"?"#00e59b":result.trend==="BEARISH"?"#ff4d6d":"#f0c040";
+
+  return(
+    <div className="fade-in">
+      {/* Direction Banner */}
+      <div className="glow" style={{background:col+"0d",border:`2px solid ${col}40`,borderRadius:10,padding:"16px",marginBottom:14,textAlign:"center"}}>
+        <div style={{color:col,fontSize:26,fontWeight:700,letterSpacing:1}}>
+          {result.direction==="BUY"?"▲ BUY / RISE":result.direction==="SELL"?"▼ SELL / FALL":"⏳ WAIT"}
+        </div>
+        <div style={{display:"flex",justifyContent:"center",gap:16,marginTop:8}}>
+          <div style={{textAlign:"center"}}>
+            <div style={{color:"#2a3f55",fontSize:9,marginBottom:2}}>CONFIDENCE</div>
+            <div style={{color:confCol,fontSize:18,fontWeight:700}}>{result.confidence}%</div>
+          </div>
+          <div style={{width:1,background:"#0e2235"}}/>
+          <div style={{textAlign:"center"}}>
+            <div style={{color:"#2a3f55",fontSize:9,marginBottom:2}}>TREND</div>
+            <div style={{color:trendCol,fontSize:13,fontWeight:700}}>{result.trend}</div>
+          </div>
+          <div style={{width:1,background:"#0e2235"}}/>
+          <div style={{textAlign:"center"}}>
+            <div style={{color:"#2a3f55",fontSize:9,marginBottom:2}}>PHASE</div>
+            <div style={{color:"#8aa0b8",fontSize:11,fontWeight:700}}>{result.marketPhase?.toUpperCase()}</div>
+          </div>
+        </div>
+      </div>
+
+      {/* Pattern detected */}
+      {result.patternFound&&(
+        <div style={{background:"rgba(0,170,255,0.06)",border:"1px solid rgba(0,170,255,0.2)",borderRadius:8,padding:"10px 14px",marginBottom:14,display:"flex",alignItems:"center",gap:10}}>
+          <span style={{fontSize:20}}>🔍</span>
+          <div>
+            <div style={{color:"#00aaff",fontSize:10,fontWeight:700,marginBottom:2}}>PATTERN DETECTED</div>
+            <div style={{color:"#c8ddf0",fontSize:12}}>{result.patternFound}</div>
+          </div>
+        </div>
+      )}
+
+      {/* Price levels */}
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:14}}>
+        {[
+          {lb:"ENTRY ZONE",v:result.entryZone,c:col},
+          {lb:"RISK : REWARD",v:result.riskReward,c:"#f0c040"},
+          {lb:"STOP LOSS",v:result.stopLoss,c:"#ff4d6d"},
+          {lb:"TAKE PROFIT 1",v:result.takeProfit1,c:"#00e59b"},
+          {lb:"TAKE PROFIT 2",v:result.takeProfit2,c:"#00aaff"},
+          {lb:"TAKE PROFIT 3",v:result.takeProfit3,c:"#a78bfa"},
+        ].map(({lb,v,c})=>(
+          <div key={lb} style={{background:"#060f1a",border:"1px solid #0e2235",borderRadius:6,padding:"8px 10px"}}>
+            <div style={{color:"#2a3f55",fontSize:9,textTransform:"uppercase",letterSpacing:1,marginBottom:3}}>{lb}</div>
+            <div style={{color:c,fontSize:12,fontWeight:700}}>{v||"—"}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* When to enter */}
+      <div style={{background:"rgba(240,192,64,0.05)",border:"1px solid rgba(240,192,64,0.2)",borderRadius:8,padding:"10px 14px",marginBottom:14,display:"flex",alignItems:"center",gap:10}}>
+        <span style={{fontSize:20}}>⚡</span>
+        <div>
+          <div style={{color:"#f0c040",fontSize:10,fontWeight:700,marginBottom:2}}>WHEN TO ENTER</div>
+          <div style={{color:"#c8ddf0",fontSize:12}}>{result.bestTimeToEnter}</div>
+        </div>
+      </div>
+
+      {/* Key levels */}
+      {result.keyLevels&&result.keyLevels.length>0&&(
+        <div style={{background:"#0a1929",border:"1px solid #0e2235",borderRadius:8,padding:"12px 14px",marginBottom:14}}>
+          <div style={{color:"#4a6080",fontSize:10,fontWeight:700,letterSpacing:2,textTransform:"uppercase",marginBottom:10}}>Key Price Levels</div>
+          <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+            {result.keyLevels.map((l,i)=>(
+              <span key={i} style={{background:"#060f1a",border:"1px solid #1e2d3d",borderRadius:4,padding:"4px 10px",fontSize:11,color:"#8aa0b8"}}>{l}</span>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* AI Reasoning */}
+      <div style={{background:"#060f1a",border:`1px solid ${col}25`,borderRadius:8,padding:"12px 14px",marginBottom:14}}>
+        <div style={{color:col,fontSize:10,fontWeight:700,letterSpacing:2,textTransform:"uppercase",marginBottom:8}}>🤖 AI ANALYSIS</div>
+        <div style={{color:"#8aa0b8",fontSize:11,lineHeight:1.8}}>{result.reasoning}</div>
+      </div>
+
+      {/* Warnings */}
+      {result.warnings&&(
+        <div style={{background:"rgba(255,77,109,0.05)",border:"1px solid rgba(255,77,109,0.2)",borderRadius:8,padding:"10px 14px",marginBottom:14}}>
+          <div style={{color:"#ff4d6d",fontSize:10,fontWeight:700,marginBottom:6}}>⚠️ WARNINGS</div>
+          <div style={{color:"#8aa0b8",fontSize:11,lineHeight:1.7}}>{result.warnings}</div>
+        </div>
+      )}
+
+      {/* How to place on MT5 */}
+      <div style={{background:"#0a1929",border:"1px solid #1a3050",borderRadius:8,padding:"12px 14px",marginBottom:14}}>
+        <div style={{color:"#00e59b",fontSize:10,fontWeight:700,letterSpacing:2,textTransform:"uppercase",marginBottom:10}}>HOW TO PLACE ON MT5</div>
+        <div style={{color:"#8aa0b8",fontSize:11,lineHeight:2.1}}>
+          1. Open MT5 → go to your chart<br/>
+          2. Tap <strong style={{color:col}}>{result.direction==="BUY"?"BUY button":"SELL button"}</strong><br/>
+          3. Set Stop Loss: <strong style={{color:"#ff4d6d"}}>{result.stopLoss}</strong><br/>
+          4. Set Take Profit: <strong style={{color:"#00e59b"}}>{result.takeProfit1}</strong><br/>
+          5. Enter when: <strong style={{color:"#f0c040"}}>{result.bestTimeToEnter}</strong>
+        </div>
+      </div>
+
+      {/* Uploaded chart preview */}
+      <div style={{background:"#0a1929",border:"1px solid #0e2235",borderRadius:8,overflow:"hidden",marginBottom:14}}>
+        <div style={{padding:"8px 12px",borderBottom:"1px solid #0e2235",color:"#4a6080",fontSize:10,fontWeight:700,letterSpacing:2,textTransform:"uppercase"}}>Your Chart</div>
+        <img src={preview} alt="Chart" style={{width:"100%",display:"block"}}/>
+      </div>
+
+      {/* Disclaimer */}
+      <div style={{padding:"10px 14px",background:"rgba(255,77,109,0.04)",border:"1px solid rgba(255,77,109,0.15)",borderRadius:6,fontSize:10,color:"#2a3f55",lineHeight:1.7}}>
+        <span style={{color:"#ff4d6d",fontWeight:700}}>⚠ DISCLAIMER: </span>
+        AI analysis is for educational purposes only. Always use proper risk management. Never risk money you cannot afford to lose.
+      </div>
+    </div>
+  );
+}
+
+// ── Main App ──────────────────────────────────────────────────────────────────
+function App(){
+  const [image,setImage]=useState(null);
+  const [timeframe,setTimeframe]=useState("M15");
+  const [instrument,setInstrument]=useState("Volatility 75");
+  const [loading,setLoading]=useState(false);
+  const [result,setResult]=useState(null);
+  const [error,setError]=useState(null);
+
+  const analyze=async()=>{
+    if(!image)return;
+    setLoading(true);
+    setResult(null);
+    setError(null);
+    try{
+      const res=await analyzeChart(image.base64,image.mediaType,timeframe,instrument);
+      setResult(res);
+    }catch(e){
+      setError("Analysis failed. Please try again with a clearer chart screenshot.");
+      console.error(e);
+    }
+    setLoading(false);
+  };
+
+  const reset=()=>{setImage(null);setResult(null);setError(null);};
+
+  return(
+    <div style={{minHeight:"100vh",background:"#060f1a",paddingBottom:40}}>
+      <Header/>
+      <div style={{padding:"16px"}}>
+
+        {!result&&!loading&&(
+          <>
+            <UploadZone onImage={img=>{setImage(img);setResult(null);setError(null);}}/>
+            <Settings timeframe={timeframe} setTimeframe={setTimeframe} instrument={instrument} setInstrument={setInstrument}/>
+
+            {image&&(
+              <div className="fade-in">
+                <div style={{background:"#0a1929",border:"1px solid #0e2235",borderRadius:8,overflow:"hidden",marginBottom:14}}>
+                  <div style={{padding:"8px 12px",borderBottom:"1px solid #0e2235",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                    <span style={{color:"#4a6080",fontSize:10,fontWeight:700,textTransform:"uppercase",letterSpacing:2}}>Chart Ready</span>
+                    <span style={{color:"#00e59b",fontSize:10}}>✓ {image.name}</span>
+                  </div>
+                  <img src={image.preview} alt="Chart preview" style={{width:"100%",display:"block",maxHeight:200,objectFit:"cover"}}/>
+                </div>
+                <button
+                  onClick={analyze}
+                  style={{width:"100%",background:"linear-gradient(135deg,#00e59b,#00aaff)",border:"none",borderRadius:8,color:"#000",padding:"14px",fontWeight:700,cursor:"pointer",fontSize:14,fontFamily:"'JetBrains Mono',monospace",letterSpacing:1}}
+                >
+                  🤖 ANALYZE WITH AI
+                </button>
+              </div>
+            )}
+
+            {!image&&(
+              <div style={{background:"#0a1929",border:"1px solid #0e2235",borderRadius:8,padding:16}}>
+                <div style={{color:"#4a6080",fontSize:10,fontWeight:700,letterSpacing:2,textTransform:"uppercase",marginBottom:12}}>How It Works</div>
+                {[
+                  {icon:"📱",t:"Open MT5",d:"Go to your MT5 app and open the chart you want to trade"},
+                  {icon:"📸",t:"Take Screenshot",d:"Take a screenshot of your MT5 chart"},
+                  {icon:"⬆️",t:"Upload Here",d:"Tap the upload box above and select your screenshot"},
+                  {icon:"🤖",t:"Get AI Analysis",d:"AI reads your chart and gives entry, SL and TP levels"},
+                  {icon:"💰",t:"Place Trade",d:"Use the analysis to place your trade on MT5"},
+                ].map(({icon,t,d},i)=>(
+                  <div key={i} style={{display:"flex",gap:12,marginBottom:14,alignItems:"flex-start"}}>
+                    <span style={{fontSize:20,minWidth:28}}>{icon}</span>
+                    <div>
+                      <div style={{color:"#c8ddf0",fontSize:12,fontWeight:700,marginBottom:2}}>{t}</div>
+                      <div style={{color:"#4a6080",fontSize:11,lineHeight:1.6}}>{d}</div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {error&&(
+              <div style={{marginTop:14,padding:"12px 14px",background:"rgba(255,77,109,0.08)",border:"1px solid rgba(255,77,109,0.3)",borderRadius:8,color:"#ff4d6d",fontSize:11}}>
+                ❌ {error}
+              </div>
+            )}
+          </>
+        )}
+
+        {loading&&<LoadingScreen/>}
+
+        {result&&!loading&&(
+          <>
+            <ResultCard result={result} preview={image?.preview}/>
+            <button
+              onClick={reset}
+              style={{width:"100%",background:"#0a1929",border:"1px solid #1e2d3d",borderRadius:8,color:"#4a6080",padding:"12px",fontWeight:700,cursor:"pointer",fontSize:12,fontFamily:"'JetBrains Mono',monospace",marginTop:8}}
+            >
+              📸 Analyze Another Chart
+            </button>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("app")).render(<App/>);
+</script>
+</body>
+</html>
